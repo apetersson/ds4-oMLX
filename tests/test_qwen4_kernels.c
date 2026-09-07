@@ -1228,6 +1228,8 @@ static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t c
            wtype == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8_0(a, rows, cols, shadow, 0.05f);
 }
 
+static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n);
+
 /* Routed gate/up and down types can differ; shared experts stay Q8_0
  * for quantized cases and F32 for the F32 case. */
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
@@ -1306,6 +1308,32 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
                                             sg_off, su_off, shared_type), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              sd_off, shared_type), "moe down");
+    if (dtype == 10u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
+        const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
+        float *bm = malloc(nm * sizeof(float)), *bp = malloc(np * sizeof(float));
+        float *am = malloc(nm * sizeof(float)), *ap = malloc(np * sizeof(float));
+        require_ok(bm && bp && am && ap, "MoE exact allocation");
+        for (uint32_t mode = 0; mode < 7; mode++) {
+            const char *nr[] = {"2", "1", "1", "2", "2", "4", "4"};
+            const char *nsg[] = {"4", "4", "8", "4", "8", "4", "8"};
+            setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", mode ? "1" : "0", 1);
+            setenv("DS4_QWEN4_MOE_MV_NR", nr[mode], 1);
+            setenv("DS4_QWEN4_MOE_MV_NSG", nsg[mode], 1);
+            require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size,
+                gate_off, up_off, wtype, NE, T, slots, E, F, sg_off, su_off, shared_type), "exact mid");
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size,
+                down_off, dtype, NE, T, slots, F, E, sd_off, shared_type), "exact down");
+            require_ok(ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
+                       ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "exact read");
+            if (!mode) { memcpy(bm, am, nm * sizeof(float)); memcpy(bp, ap, np * sizeof(float)); }
+            else { check_exact_f32("specialized IQ2 mid", am, bm, nm);
+                   check_exact_f32("specialized Q2 down", ap, bp, np); }
+        }
+        unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
+        unsetenv("DS4_QWEN4_MOE_MV_NR");
+        unsetenv("DS4_QWEN4_MOE_MV_NSG");
+        free(bm); free(bp); free(am); free(ap);
+    }
     if (dtype == 10u) {
         require_ok(!ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off,
                     dtype, NE, T, slots, F + 1u, E, 0, UINT32_MAX),
@@ -2263,6 +2291,14 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
+    if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
+        test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
+        test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
+        test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
+        test_moe_types(&arena, 8, 6, 256, 672, 3, 16u, 10u);
+        printf("all Qwen MoE decode specialization tests passed\n");
+        return 0;
+    }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
         test_q4k_ordered_exact(&arena, 1, 640, true);

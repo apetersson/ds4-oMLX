@@ -61,6 +61,24 @@ memory. File size alone does not establish whether it fits a 64 GB Mac.
 See the [quality and memory measurements](../speed-bench/qwen38-iq2-quality.md)
 for the comparison with Q4_K, Q4_0 and Q8.
 
+For the padded Q2_K-down build, the 640 live activation values use a
+768-value physical weight row; padding is skipped without changing the
+activation layout. On M3 Ultra, IQ2_XXS and Q2_K expert decode specializes
+the quantization and logical width and uses one row per SIMD group, with
+eight SIMD groups per threadgroup. Set `DS4_QWEN4_MOE_MV_SPECIALIZE=0` to
+restore generic decode. `DS4_QWEN4_MOE_MV_NR` (1, 2 or 4) and
+`DS4_QWEN4_MOE_MV_NSG` (1 through 8) allow explicit geometry comparisons.
+
+For these low-bit expert formats on M3 Ultra, prefill uses 8-token tiles
+through 512-token batches, 16-token tiles through 1024, and 32-token tiles
+for larger batches. This avoids unused matrix products when few tokens
+route to each expert. The K accumulation order is unchanged.
+`DS4_QWEN4_MOE_MID_NT=4 DS4_QWEN4_MOE_DOWN_NT=4` restores the original
+prefill tiles; each override accepts 1, 2 or 4 groups of eight tokens.
+Other devices and quantizations retain their previous default geometry.
+See [the padded Q2 speed measurements](../speed-bench/qwen38-q2-speed.md)
+for end-to-end timings and numerical checks.
+
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.
 

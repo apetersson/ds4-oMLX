@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Interleave greedy CLI MTP runs and retain timing and output parity evidence.
+"""Interleave greedy CLI runs and retain timing and output parity evidence.
 
 Save the baseline executable, metal/qwen4.metal, and metal/moe.metal before
 editing: the executable loads Metal sources at runtime. Model loading and
 prefill are excluded from generation rate. Warmups are excluded from medians.
+MTP is enabled by default; --no-mtp measures ordinary decoding.
 """
 
 import argparse
@@ -53,6 +54,7 @@ def main():
     ap.add_argument("--case", choices=CASES, action="append")
     ap.add_argument("--prompt-file", type=Path, help="benchmark a longer raw prompt instead of the built-in cases")
     ap.add_argument("--tokens", type=int, default=256, help="generated tokens for --prompt-file (default: 256)")
+    ap.add_argument("--no-mtp", action="store_true", help="compare ordinary greedy decoding")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     if args.repeats < 1:
@@ -60,7 +62,7 @@ def main():
     if args.prompt_file and args.case:
         ap.error("--prompt-file and --case are mutually exclusive")
     if args.tokens < 3:
-        ap.error("--tokens must be at least 3 to exercise MTP verification")
+        ap.error("--tokens must be at least 3 for the generation comparison")
     overrides = {}
     for item in args.candidate_env:
         key, sep, value = item.partition("=")
@@ -84,7 +86,7 @@ def main():
                     for name, (binary, source, moe_source) in configs.items()},
         "shared_metal_sha256": {str(p.relative_to(ROOT)): sha256(p) for p in sorted((ROOT / "metal").glob("*"))
                                 if p.is_file() and p.name not in ("qwen4.metal", "moe.metal")},
-        "candidate_env": overrides, "records": [],
+        "candidate_env": overrides, "mtp": not args.no_mtp, "records": [],
         "prompt_file": ({"path": str(args.prompt_file.resolve()), "sha256": sha256(args.prompt_file)}
                         if args.prompt_file else None),
     }
@@ -93,7 +95,9 @@ def main():
         binary, source, moe_source = configs[name]
         prompt, tokens = (None, args.tokens) if args.prompt_file else CASES[case]
         cmd = [str(binary), "-m", str(args.model.resolve()), "--metal", "--ctx", str(args.ctx),
-               "-n", str(tokens), "--temp", "0", "--nothink", "--mtp", "--mtp-timing"]
+               "-n", str(tokens), "--temp", "0", "--nothink"]
+        if not args.no_mtp:
+            cmd += ["--mtp", "--mtp-timing"]
         cmd += (["--prompt-file", str(args.prompt_file.resolve()), "--raw-prompt"]
                 if args.prompt_file else ["-p", prompt])
         if args.ple:
@@ -111,12 +115,12 @@ def main():
             subprocess.run(cmd, cwd=ROOT, env=env, stdout=out, stderr=err, check=True)
         log = stem.with_suffix(".stderr").read_text()
         rates, accepts = RATE.findall(log), ACCEPT.findall(log)
-        if not rates or not accepts or int(accepts[-1][0]) == 0:
+        if not rates or (not args.no_mtp and (not accepts or int(accepts[-1][0]) == 0)):
             raise RuntimeError(f"Missing generation or MTP verification evidence in {stem}")
         rec = {"config": name, "case": case, "repeat": repeat, "warmup": repeat < 0,
                "command": cmd, "prefill_tps": float(rates[-1][0]),
-               "decode_tps": float(rates[-1][1]), "cycles": int(accepts[-1][0]),
-               "accepted": int(accepts[-1][1]), "wall_s": time.monotonic() - start,
+               "decode_tps": float(rates[-1][1]), "cycles": int(accepts[-1][0]) if accepts else 0,
+               "accepted": int(accepts[-1][1]) if accepts else 0, "wall_s": time.monotonic() - start,
                "output_sha256": sha256(stem.with_suffix(".stdout"))}
         report["records"].append(rec)
         (args.out / "results.json").write_text(json.dumps(report, indent=2) + "\n")

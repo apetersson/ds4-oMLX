@@ -7,8 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-enum { D = 256, F = 256, O = 260, E = 8, S = 3, STRIDE = 4 };
-typedef struct { uint32_t type, block, values; uint64_t gate, up, down; } format;
+enum { D = 256, O = 260, E = 8, S = 3, STRIDE = 4 };
+typedef struct { uint32_t type, block, values, ff; uint64_t gate, up, down; } format;
 static uint32_t rng = 123;
 static uint32_t random_u32(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
@@ -28,6 +28,7 @@ static void fill(uint8_t *p, uint64_t bytes, const format *f) {
 }
 
 static int check(const void *map, uint64_t bytes, const format *f, uint32_t T) {
+    const uint32_t F = f->ff;
     const uint64_t mid_n = (uint64_t)T * STRIDE * F, out_n = (uint64_t)T * STRIDE * O;
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)T * D * sizeof(float));
     ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)T * S * sizeof(int32_t));
@@ -38,7 +39,8 @@ static int check(const void *map, uint64_t bytes, const format *f, uint32_t T) {
     float *host_x = malloc((uint64_t)T * D * sizeof(float));
     int32_t *host_ids = malloc((uint64_t)T * S * sizeof(int32_t));
     float *ref_mid = malloc(mid_n * sizeof(float)), *ref_out = malloc(out_n * sizeof(float));
-    float *actual = malloc(out_n * sizeof(float));
+    /* Padded Q2 cases have a wider intermediate than the output projection. */
+    float *actual = malloc((mid_n > out_n ? mid_n : out_n) * sizeof(float));
     int ok = x && ids && lists && counts && mid && out && host_x && host_ids && ref_mid && ref_out && actual;
     if (!ok) goto done;
     for (uint64_t i = 0; i < (uint64_t)T * D; i++) host_x[i] = ((int)(random_u32() % 257) - 128) / 1024.0f;
@@ -52,8 +54,11 @@ static int check(const void *map, uint64_t bytes, const format *f, uint32_t T) {
     ok = ds4_gpu_tensor_write(x, 0, host_x, (uint64_t)T * D * sizeof(float)) &&
          ds4_gpu_tensor_write(ids, 0, host_ids, (uint64_t)T * S * sizeof(int32_t)) &&
          ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, ids, T, S, E, T);
-    for (int run = 0; run < 3 && ok; run++) {
-        ok = setenv("DS4_QWEN4_MOE_MM_SPECIALIZE", run == 1 ? "1" : "0", 1) == 0;
+    for (int run = 0; run < 5 && ok; run++) {
+        ok = setenv("DS4_QWEN4_MOE_MM_SPECIALIZE", run > 0 && run < 4 ? "1" : "0", 1) == 0;
+        const char *tiles[] = {"4", "1", "2", "4", "4"};
+        ok = ok && setenv("DS4_QWEN4_MOE_MID_NT", tiles[run], 1) == 0 &&
+             setenv("DS4_QWEN4_MOE_DOWN_NT", tiles[run], 1) == 0;
         ok = ok && ds4_gpu_tensor_fill_f32(mid, NAN, mid_n) &&
              ds4_gpu_tensor_fill_f32(out, NAN, out_n) &&
              ds4_gpu_begin_commands() &&
@@ -79,6 +84,8 @@ static int check(const void *map, uint64_t bytes, const format *f, uint32_t T) {
     if (ok) printf("PASS Qwen MoE specialization type=%u T=%u mid/down exact, padding intact\n", f->type, T);
 done:
     unsetenv("DS4_QWEN4_MOE_MM_SPECIALIZE");
+    unsetenv("DS4_QWEN4_MOE_MID_NT");
+    unsetenv("DS4_QWEN4_MOE_DOWN_NT");
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(lists);
     ds4_gpu_tensor_free(counts); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(out);
     free(host_x); free(host_ids); free(ref_mid); free(ref_out); free(actual);
@@ -86,15 +93,15 @@ done:
 }
 
 int main(void) {
-    format formats[] = {{12,144,256,0,0,0}, {16,66,256,0,0,0}, {10,84,256,0,0,0},
-                        {8,34,32,0,0,0}, {39,17,32,0,0,0}, {2,18,32,0,0,0}};
+    format formats[] = {{12,144,256,256,0,0,0}, {16,66,256,256,0,0,0}, {10,84,256,640,0,0,0},
+                        {8,34,32,256,0,0,0}, {39,17,32,256,0,0,0}, {2,18,32,256,0,0,0}};
     const uint32_t sizes[] = {9, 31, 32, 33, 65, 257};
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     uint64_t bytes = 0;
     for (unsigned i = 0; i < sizeof(formats) / sizeof(*formats); i++) {
         format *f = &formats[i];
-        const uint64_t gu = (uint64_t)E * F * (D / f->values) * f->block;
-        const uint64_t dw = (uint64_t)E * O * (F / f->values) * f->block;
+        const uint64_t gu = (uint64_t)E * f->ff * (D / f->values) * f->block;
+        const uint64_t dw = (uint64_t)E * O * ((f->ff + f->values - 1u) / f->values) * f->block;
         f->gate = bytes; f->up = align_up(bytes + gu, page);
         f->down = align_up(f->up + gu, page); bytes = align_up(f->down + dw, page);
     }
@@ -103,9 +110,9 @@ int main(void) {
     memset(map, 0, bytes);
     for (unsigned i = 0; i < sizeof(formats) / sizeof(*formats); i++) {
         const format *f = &formats[i];
-        const uint64_t gu = (uint64_t)E * F * (D / f->values) * f->block;
+        const uint64_t gu = (uint64_t)E * f->ff * (D / f->values) * f->block;
         fill((uint8_t *)map + f->gate, gu, f); fill((uint8_t *)map + f->up, gu, f);
-        fill((uint8_t *)map + f->down, (uint64_t)E * O * (F / f->values) * f->block, f);
+        fill((uint8_t *)map + f->down, (uint64_t)E * O * ((f->ff + f->values - 1u) / f->values) * f->block, f);
     }
     int ok = ds4_gpu_init() && ds4_gpu_set_model_map(map, bytes);
     /* Alternate formats in one engine to catch incorrectly keyed pipelines. */
