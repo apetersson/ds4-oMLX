@@ -1232,6 +1232,8 @@ static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t c
  * for quantized cases and F32 for the F32 case. */
 static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, uint32_t F,
                            uint32_t T, uint32_t wtype, uint32_t dtype) {
+    /* Nonzero random padding ensures kernels ignore the physical tail. */
+    const uint32_t DF = dtype == 10u ? (F + 255u) / 256u * 256u : F;
     double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
     const bool q8 = wtype != 0u;
@@ -1239,7 +1241,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     if (q8) {
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
         up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &up_w);
-        down_off = arena_tier(a, dtype, (uint64_t)NE * E, F, &down_w);
+        down_off = arena_tier(a, dtype, (uint64_t)NE * E, DF, &down_w);
         sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
         su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
         sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
@@ -1272,7 +1274,8 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
             const uint32_t e = shared ? 0 : (uint32_t)sel[t * slots + s];
             const double *gw = shared ? sg_w : gate_w + (uint64_t)e * F * E;
             const double *uw = shared ? su_w : up_w + (uint64_t)e * F * E;
-            const double *dw = shared ? sd_w : down_w + (uint64_t)e * E * F;
+            const uint32_t stride = shared ? F : DF;
+            const double *dw = shared ? sd_w : down_w + (uint64_t)e * E * DF;
             for (uint32_t f = 0; f < F; f++) {
                 double g = 0.0, u = 0.0;
                 for (uint32_t i = 0; i < E; i++) {
@@ -1284,7 +1287,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
             const double wgt = shared ? sigmoid_d(sgate[t]) : w[t * slots + s];
             for (uint32_t d = 0; d < E; d++) {
                 double acc = 0.0;
-                for (uint32_t f = 0; f < F; f++) acc += dw[(uint64_t)d * F + f] * mid[((uint64_t)t * n_out + s) * F + f];
+                for (uint32_t f = 0; f < F; f++) acc += dw[(uint64_t)d * stride + f] * mid[((uint64_t)t * n_out + s) * F + f];
                 part[((uint64_t)t * n_out + s) * E + d] = acc;
                 out[t * E + d] += wgt * acc;
             }
@@ -1303,6 +1306,11 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
                                             sg_off, su_off, shared_type), "moe mid");
     require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off, dtype, NE, T, slots, F, E,
                                              sd_off, shared_type), "moe down");
+    if (dtype == 10u) {
+        require_ok(!ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, down_off,
+                    dtype, NE, T, slots, F + 1u, E, 0, UINT32_MAX),
+                   "Q2_K down rejects a partial activation group");
+    }
     char name[96];
     const uint32_t CH = DS4_QWEN4_HC_CHUNKS;
     float *R0 = rand_vec((uint64_t)T * 4 * E, 1.0f);
@@ -1319,7 +1327,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    const char *dname = dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
@@ -2317,6 +2325,9 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
+    test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 100, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 10u);

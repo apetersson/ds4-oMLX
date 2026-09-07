@@ -55,6 +55,34 @@ The [completed comparison](../speed-bench/qwen38-iq2-quality.md) records
 sweep and an ordinary/MTP greedy parity check. IQ2 is a candidate for a
 64 GB memory budget, pending validation on that hardware.
 
+### Experimental padded Q2_K down projections
+
+Use `--projection down` on both stages to quantize the 48 trunk down
+projections directly from BF16, with the pinned imatrix. Their 640 logical
+inputs are zero-padded to 768 for three Q2_K blocks per row. Assemble against
+the existing IQ2_XXS/MXFP4 combined model, using a new experts directory and
+output path. All other tensors, including MTP, are copied unchanged:
+
+```sh
+uv run --with numpy --with huggingface_hub python gguf-tools/qwen4_iq2.py quantize \
+  --projection down --source /path/to/official-bf16-checkpoint \
+  --imatrix /path/to/imatrix_unsloth.gguf_file \
+  --library gguf-tools/libds4quants.dylib \
+  --experts-dir /path/to/q2-down-experts --threads 8
+uv run --with numpy --with huggingface_hub python gguf-tools/qwen4_iq2.py assemble \
+  --projection down --template /path/to/IQ2XXSImatrix-MXFP4Down-MTP.gguf \
+  --experts-dir /path/to/q2-down-experts \
+  --out /path/to/IQ2XXSImatrix-Q2KDownPad768-MTP.gguf
+```
+
+This layout requires the padded-down Qwen runtime support. The GGUF stores
+physical dimensions `[768, 2560, 512]`; the architecture's expert width remains
+640. Metal decode and prefill use the padded weight stride while reading only
+640 activation columns. The CPU reference supplies zero activation padding.
+The shared expert and MTP retain their original dimensions and formats.
+Saving 88 bytes per trunk down row reduces the main model by 5.15625 GiB;
+quality and speed must be evaluated for this new recipe.
+
 ## Build
 
 ```sh

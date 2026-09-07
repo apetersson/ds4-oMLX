@@ -5386,7 +5386,11 @@ static void weights_validate_qwen4_layout(
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
+         * Activations remain 640 wide; only the weight row stride is padded. */
+        const uint32_t down_width = l->ffn_down_exps->type == DS4_TENSOR_Q2_K ?
+            (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
+        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -63750,7 +63754,8 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
     float *logits = xmalloc(NE * sizeof(float));
     double *prob = xmalloc(NE * sizeof(double));
-    float *g = xmalloc(F * sizeof(float));
+    const uint32_t down_width = (uint32_t)l->ffn_down_exps->dim[0];
+    float *g = xcalloc(down_width, sizeof(float));
     float *u = xmalloc(F * sizeof(float));
     float *y = xmalloc(E * sizeof(float));
     qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);

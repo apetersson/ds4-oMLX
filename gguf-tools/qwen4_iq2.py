@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build calibrated IQ2_XXS trunk gate/up tensors, then insert into a Qwen GGUF.
+"""Build calibrated IQ2_XXS gate/up or padded Q2_K down trunk tensors.
 
 The two stages allow quantization beside the original BF16 checkpoint and
 assembly beside an existing qwen4exp model. All other tensors are byte-copied.
@@ -15,6 +15,15 @@ import time
 from qwen4_pack import (SourceDB, QwenGGUFImatrix, GGMLQuantizer,
                         Q2_IMATRIX_SHA256, encode_weighted_experts)
 from qwen4_pack_to_qwen4exp import Reader, kv_bytes, w_str, tnbytes
+
+
+def tensor_bytes(kind, dims):
+    n = math.prod(dims)
+    if kind in (10, 16):
+        if dims[0] % 256:
+            raise ValueError('K-quant weight rows must be block aligned')
+        return n // 256 * (84 if kind == 10 else 66)
+    return tnbytes(kind, n)
 
 
 def digest(path):
@@ -38,18 +47,23 @@ def quantize(args):
     quant = GGMLQuantizer(args.library)
     quant.lib.ds4q_quantize_init(16)  # Initialize shared lookup tables before workers.
     manifest = args.experts_dir / 'experts.json'
+    down = args.projection == 'down'
+    qtype = 'Q2_K' if down else 'IQ2_XXS'
     identity = {'source': str(args.source.resolve()), 'imatrix': imatrix.provenance(),
-                'library_sha256': digest(args.library), 'format': 'IQ2_XXS'}
+                'library_sha256': digest(args.library), 'format': qtype}
+    if down:
+        identity['padding'] = {'logical_input': 640, 'physical_input': 768}
     report = json.loads(manifest.read_text()) if manifest.exists() else {**identity, 'tensors': {}}
     for key, value in identity.items():
         if report[key] != value:
             raise SystemExit(f'Resume provenance mismatch: {key}')
     for layer in range(48):
-        source = f'model.language_model.layers.{layer}.mlp.experts.gate_up_proj'
+        source = f'model.language_model.layers.{layer}.mlp.experts.' + ('down_proj' if down else 'gate_up_proj')
         info = db.tensors[source]
-        if info['dtype'] != 'BF16' or info['shape'] != (512, 1280, 2560):
+        shape = (512, 2560, 640) if down else (512, 1280, 2560)
+        if info['dtype'] != 'BF16' or info['shape'] != shape:
             raise SystemExit(f'Unexpected source layout: {source}: {info}')
-        names = [f'blk.{layer}.ffn_{part}_exps.weight' for part in ('gate', 'up')]
+        names = [f'blk.{layer}.ffn_{part}_exps.weight' for part in (('down',) if down else ('gate', 'up'))]
         if all(n in report['tensors'] and (args.experts_dir / n).is_file() and
                digest(args.experts_dir / n) == report['tensors'][n]['sha256'] for n in names):
             print(f'Layer {layer}: verified existing tensors', flush=True)
@@ -58,9 +72,10 @@ def quantize(args):
         source_hash = hashlib.sha256(values).hexdigest()
         for part, name in enumerate(names):
             start = time.monotonic()
-            raw = encode_weighted_experts(values[:, part * 640:(part + 1) * 640, :],
-                                         'IQ2_XXS', imatrix, name, quant, args.threads)
-            if len(raw) != 512 * 640 * 10 * 66:
+            raw = encode_weighted_experts(values if down else values[:, part * 640:(part + 1) * 640, :],
+                                         qtype, imatrix, name, quant, args.threads,
+                                         pad_last_to=768 if down else 0)
+            if len(raw) != (512 * 2560 * 3 * 84 if down else 512 * 640 * 10 * 66):
                 raise SystemExit(f'Invalid output size for {name}')
             path = args.experts_dir / name
             tmp = path.with_suffix('.incomplete')
@@ -79,32 +94,51 @@ def assemble(args):
     if args.out.exists() or Path(str(args.out) + '.incomplete').exists():
         raise SystemExit('Output already exists; choose a new path')
     manifest = json.loads((args.experts_dir / 'experts.json').read_text())
-    expected = {f'blk.{i}.ffn_{p}_exps.weight' for i in range(48) for p in ('gate', 'up')}
+    down = args.projection == 'down'
+    expected = {f'blk.{i}.ffn_{p}_exps.weight' for i in range(48) for p in (('down',) if down else ('gate', 'up'))}
     if set(manifest['tensors']) != expected:
-        raise SystemExit('Expected all 96 calibrated trunk tensors')
+        raise SystemExit(f'Expected all {len(expected)} calibrated trunk tensors')
+    if manifest['format'] != ('Q2_K' if down else 'IQ2_XXS'):
+        raise SystemExit('Quantization format does not match projection')
+    if down and manifest.get('padding') != {'logical_input': 640, 'physical_input': 768}:
+        raise SystemExit('Invalid down projection padding provenance')
     base = Reader(str(args.template))
     if base.kv.get('general.architecture') != 'qwen4exp' or base.kv.get('qwen4exp.block_count') != 49:
         raise SystemExit('Template must be a combined 49-layer qwen4exp GGUF')
     if 'per_layer_token_embd.weight' in base.tensors:
         raise SystemExit('Template must use an external PLE sidecar')
+    if down:
+        for layer in range(48):
+            for part in ('gate', 'up'):
+                kind, dims, _ = base.tensors[f'blk.{layer}.ffn_{part}_exps.weight']
+                if kind != 16 or dims != [2560, 640, 512]:
+                    raise SystemExit('Down experiment requires the existing IQ2_XXS trunk recipe')
     alignment = base.kv.get('general.alignment', 32)
     align = lambda n: (n + alignment - 1) // alignment * alignment
     metadata = {k: (base.kv_types[k], v) for k, v in base.kv.items()}
-    metadata['general.name'] = (8, 'Qwen3.8 Flash Next IQ2_XXS imatrix trunk, MXFP4 down, MTP')
+    metadata['general.name'] = (8, 'Qwen3.8 Flash Next IQ2_XXS imatrix trunk, ' +
+                               ('padded Q2_K down' if down else 'MXFP4 down') + ', MTP')
     metadata['general.file_type'] = (4, 19)  # LLAMA_FTYPE_MOSTLY_IQ2_XXS
     metadata['ds4.iq2.imatrix_sha256'] = (8, manifest['imatrix']['sha256'])
+    if down:
+        metadata['ds4.qwen4.down.logical_input'] = (4, 640)
+        metadata['ds4.qwen4.down.physical_input'] = (4, 768)
     plan = []
     offset = 0
     for name, (kind, dims, old_offset) in base.tensors.items():
         replace = name in expected
-        if replace and (kind != 12 or dims != [2560, 640, 512]):
+        if replace and (kind != (39 if down else 12) or dims != ([640, 2560, 512] if down else [2560, 640, 512])):
             raise SystemExit(f'Unexpected template expert layout: {name}')
-        size = math.prod(dims) // 256 * 66 if replace else tnbytes(kind, math.prod(dims))
+        if replace:
+            kind = 10 if down else 16
+            if down:
+                dims = [768, 2560, 512]
+        size = tensor_bytes(kind, dims)
         if replace:
             path = args.experts_dir / name
             if path.stat().st_size != size or digest(path) != manifest['tensors'][name]['sha256']:
                 raise SystemExit(f'Invalid calibrated payload: {name}')
-        plan.append((name, 16 if replace else kind, dims, offset, size, old_offset))
+        plan.append((name, kind, dims, offset, size, old_offset))
         offset = align(offset + size)
     prefix = b'GGUF' + struct.pack('<IQQ', 3, len(plan), len(metadata))
     prefix += b''.join(kv_bytes(k, t, v) for k, (t, v) in metadata.items())
@@ -173,6 +207,7 @@ def main():
     a.add_argument('--out', type=Path, required=True)
     for p in (q, a):
         p.add_argument('--experts-dir', type=Path, required=True)
+        p.add_argument('--projection', choices=('gate-up', 'down'), default='gate-up')
     args = ap.parse_args()
     (quantize if args.stage == 'quantize' else assemble)(args)
 

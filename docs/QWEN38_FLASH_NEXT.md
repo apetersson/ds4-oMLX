@@ -50,6 +50,11 @@ memory. File size alone does not establish whether it fits a 64 GB Mac.
 See the [quality and memory measurements](../speed-bench/qwen38-iq2-quality.md)
 for the comparison with Q4_K, Q4_0 and Q8.
 
+An [experimental padded Q2_K down build](../speed-bench/qwen38-q2down.md)
+reduces the IQ2 main model from 46.89 to 41.73 GiB. It needs the padded-down
+runtime support in this checkout and retains the external PLE sidecar.
+The report records the measured quality and speed tradeoff.
+
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.
 

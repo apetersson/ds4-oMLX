@@ -1719,10 +1719,12 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
     } else if (weight_type == 10) {
         /* q2_K: 84-byte super-blocks of 256 (16 scale/min nibble pairs, 64 packed 2-bit bytes, d, dmin);
          * lane owns 8 consecutive elements: group = lane/2 (16 per block), l = (lane%2)*8 */
-        const uint nb = in_dim / 256;
+        const uint nb = (in_dim + 255u) / 256u;
         const uint group = tiisg / 2, l = (tiisg % 2) * 8;
         const uint q_base = 32u * (group / 8u) + 16u * (group & 1u), shift = ((group / 2u) & 3u) * 2u;
         for (uint ib = 0; ib < nb; ib++) {
+            /* Padded Q2_K down weights have no corresponding activation tail. */
+            if (ib * 256u + group * 16u + l >= in_dim) continue;
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 84);
             const float d = (float)(*(device const half *)(blk + 80));
             const float dmin = (float)(*(device const half *)(blk + 82));
