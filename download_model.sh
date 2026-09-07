@@ -5,8 +5,9 @@ GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
 GLM53_FULL_REPO="antirez/glm-5.3-gguf"
-# Qwen3.8 DS4 release; will move to the antirez org — flip this one line then.
+# Qwen3.8 DS4 releases; the Q4 repository also hosts the shared PLE sidecar.
 QWEN38_REPO="ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4"
+QWEN38_Q2_REPO="ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
@@ -34,6 +35,7 @@ GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4K_MTP_FILE="Qwen3.8-Flash-Next-Q4KImatrixExperts-MXFP4Down-BF16Emb-BF16Control-Q8GDN-Q8QSA-Q8Shared-Q8Out-MTP.gguf"
+QWEN38_Q2_MTP_FILE="Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf"
 QWEN38_PLE_FILE="Qwen3.8-Flash-Next-PLE-Q4_1.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 
@@ -73,6 +75,7 @@ Usage:
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
   ./download_model.sh glm53-vision [--token TOKEN]
+  ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
 
@@ -174,6 +177,15 @@ Targets:
   glm53-vision
        GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
        with --vision; this target does not update ./ds4flash.gguf.
+
+  qwen38-q2 (alias: qwen38-iq2)
+       Qwen3.8-Flash-Next DS4 Q2: 41.73 GiB combined main/MTP GGUF,
+       plus the required ~29.80 GiB external PLE sidecar from the Q4 repo.
+       Imatrix IQ2_XXS gate/up and Q2_K down experts (640 logical inputs,
+       padded to 768 on disk), with higher-precision dense/control tensors.
+       Smaller option for 64 GB Macs: start with --ctx 8192 and
+       --prefill-chunk 1024; context and resident PLE pages also use memory.
+       Requires the current Qwen runtime. Use --ple; --mtp is optional.
 
   qwen38-q4k
        Qwen3.8-Flash-Next DS4 Q4_K imatrix build: one combined main/MTP
@@ -316,6 +328,11 @@ case "$MODEL" in
         MODEL_FILE=$GLM53_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    qwen38-q2|qwen38-iq2)
+        REPO=$QWEN38_Q2_REPO
+        MODEL_FILE=$QWEN38_Q2_MTP_FILE
+        FORCE_HF_DOWNLOAD=1
         ;;
     qwen38-q4k)
         REPO=$QWEN38_REPO
@@ -497,6 +514,12 @@ else
     download_one "$MODEL_FILE"
 fi
 
+# Q2 reuses the same PLE file as Q4, without duplicating it on the Hub.
+# Isolate REPO and the downloader's temporary variables from model linking.
+if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
+    (REPO=$QWEN38_REPO; download_one "$QWEN38_PLE_FILE")
+fi
+
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly:"
@@ -517,7 +540,11 @@ fi
 
 echo
 echo "Done."
-if [ "$MODEL" = qwen38-q4k ]; then
+if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
+    echo "Run with the required PLE sidecar and an 8K starting context:"
+    printf '  ./ds4 --ple "%s/%s" --ctx 8192 --prefill-chunk 1024\n' "$OUT_DIR" "$QWEN38_PLE_FILE"
+    echo "Add --mtp to enable speculation."
+elif [ "$MODEL" = qwen38-q4k ]; then
     echo "Run with the required PLE sidecar (omit --mtp for ordinary decode):"
     printf '  ./ds4 --ple "%s/%s" --mtp\n' "$OUT_DIR" "$QWEN38_PLE_FILE"
 fi

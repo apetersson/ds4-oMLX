@@ -160,15 +160,23 @@ model through a separate encoder.
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Qwen3.8 uses one combined main/MTP GGUF plus a required external PLE sidecar:
+Qwen3.8's smaller Q2 release uses a **41.73 GiB** combined main/MTP GGUF,
+with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections. It saves
+11% over the previous Q2 release and is the starting option for 64 GB Macs.
+The required external PLE sidecar is about 29.80 GiB on disk; its resident
+pages and context buffers also consume RAM. Start with 8K context:
 
 ```sh
-./download_model.sh qwen38-q4k
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+./download_model.sh qwen38-q2
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024
 ```
 
-The download updates `ds4flash.gguf` to the combined model. Omit `--mtp` for
-ordinary decode with the same files. Vision uses a separate encoder;
+The download fetches both required files and updates `ds4flash.gguf` to the
+combined model. Add `--mtp` for speculation with the same files. The larger
+`qwen38-q4k` target remains available for higher precision. On an M3 Ultra,
+the new Q2 measured essentially unchanged speed and modest additional quality
+drift; see the [comparison](speed-bench/qwen38-q2down.md). Those measurements
+used a 512 GiB machine, not a physical 64 GB system. Vision uses a separate encoder;
 `./download_model.sh qwen38-vision` downloads it, and you pass it as
 `--vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf`. See
 [Qwen setup](docs/QWEN38_FLASH_NEXT.md)

@@ -9,22 +9,28 @@ indexer, four-stream hyper-connections, the hashed per-layer n-gram table,
 
 ## Download and run
 
-The [DS4 Q4 release](https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-Q4)
-contains one combined main/MTP GGUF and a required external PLE sidecar,
-about 107 GB (100 GiB) together on disk:
+The [DS4 Q2 release](https://huggingface.co/ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2)
+contains a **41.73 GiB** combined main/MTP GGUF. It uses IQ2_XXS gate/up
+experts and Q2_K down projections, with weight rows padded from 640 to 768
+columns. The required external Q4_1 PLE sidecar is reused from the Q4 repo;
+together the files use about **76.81 GB (71.53 GiB)** on disk. For a 64 GB
+Mac, start with 8K context and a 1,024-token prefill chunk:
 
 ```sh
-./download_model.sh qwen38-q4k
-./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
-./ds4-server --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp --mtp-exact-sampling
-./ds4-agent --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --mtp
+./download_model.sh qwen38-q2
+./ds4 --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024
+./ds4-server --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024 --mtp --mtp-exact-sampling
+./ds4-agent --ple gguf/Qwen3.8-Flash-Next-PLE-Q4_1.gguf --ctx 8192 --prefill-chunk 1024 --mtp
 ```
 
 The downloader links `ds4flash.gguf` to the combined model. Both ordinary and
 MTP decode use this same GGUF and PLE sidecar; omit `--mtp` for ordinary decode.
 Adjust the PLE path if you set `DS4_GGUF_DIR`. The external PLE table is mapped
-separately, allowing this release to run on 128 GB Macs; context size and other
-workloads still affect memory use.
+separately and demand-paged on the CPU; resident pages still consume RAM.
+Context, host allocations, and other workloads also affect memory use. The
+[Q2 comparison](../speed-bench/qwen38-q2down.md) was measured on an M3 Ultra
+with 512 GiB, so it is not a physical 64 GB fit test. The larger
+`./download_model.sh qwen38-q4k` target remains available for higher precision.
 
 Use `ds4-agent` for native terminal and web tools. Its `bash` tool executes
 commands; `google_search` and `visit_page` use a visible Chrome browser.
@@ -42,18 +48,18 @@ Vision needs llama.cpp's mmproj encoder, which is a separate download:
 
 ## Build your own GGUF
 
-For calibrated IQ2_XXS gate/up experts with MXFP4 down projections, embedded
+The current Q2 release adds [padded Q2_K down projections](../gguf-tools/README.md#experimental-padded-q2_k-down-projections)
+to the calibrated IQ2_XXS gate/up build. It reduces the main file from 46.89
+to 41.73 GiB and requires padded-down runtime support (commit `5bd8796` or
+later on the `qwen3.8-flash-next` branch).
+
+For the previous calibrated IQ2_XXS gate/up build with MXFP4 down projections, embedded
 MTP and external PLE, use the [two-stage BF16 build](../gguf-tools/README.md#qwen38-iq2_xxs-experiment).
 Its main GGUF is 50.34 GB; the Q4_1 PLE sidecar is required separately.
 Context buffers, runtime allocations and resident PLE pages also consume
 memory. File size alone does not establish whether it fits a 64 GB Mac.
 See the [quality and memory measurements](../speed-bench/qwen38-iq2-quality.md)
 for the comparison with Q4_K, Q4_0 and Q8.
-
-An [experimental padded Q2_K down build](../speed-bench/qwen38-q2down.md)
-reduces the IQ2 main model from 46.89 to 41.73 GiB. It needs the padded-down
-runtime support in this checkout and retains the external PLE sidecar.
-The report records the measured quality and speed tradeoff.
 
 The older recipes below keep PLE inside the main GGUF, so their file sizes
 are not directly comparable with the external-PLE builds.
