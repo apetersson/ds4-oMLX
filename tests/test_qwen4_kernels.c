@@ -1313,9 +1313,9 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         float *bm = malloc(nm * sizeof(float)), *bp = malloc(np * sizeof(float));
         float *am = malloc(nm * sizeof(float)), *ap = malloc(np * sizeof(float));
         require_ok(bm && bp && am && ap, "MoE exact allocation");
-        for (uint32_t mode = 0; mode < 7; mode++) {
-            const char *nr[] = {"2", "1", "1", "2", "2", "4", "4"};
-            const char *nsg[] = {"4", "4", "8", "4", "8", "4", "8"};
+        for (uint32_t mode = 0; mode < 9; mode++) {
+            const char *nr[] = {"2", "1", "1", "2", "2", "4", "4", "1", "2"};
+            const char *nsg[] = {"4", "4", "8", "4", "8", "4", "8", "16", "16"};
             setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", mode ? "1" : "0", 1);
             setenv("DS4_QWEN4_MOE_MV_NR", nr[mode], 1);
             setenv("DS4_QWEN4_MOE_MV_NSG", nsg[mode], 1);

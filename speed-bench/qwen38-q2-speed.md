@@ -1,5 +1,9 @@
 # Padded Q2_K Qwen3.8 speed measurements
 
+This report records the first optimization round. See the
+[second round](qwen38-q2-round2.md) for subsequent geometry and tail-tile
+changes and their incremental measurements.
+
 Model: `Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf`
 (44,806,612,192 bytes), with the existing Q4_1 PLE sidecar. The main
 experts use IQ2_XXS gate/up and Q2_K down weights; the down row stores 768

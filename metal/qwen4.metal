@@ -2058,13 +2058,14 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint64_t expert_bytes;
     uint32_t n_expert;
     uint32_t tiles_per_launch;
-    uint32_t pad0;
+    uint32_t tail_base; /* host binds the same value to function constant 905 */
     uint32_t pad1;
 };
 
 /* Zero retains runtime dispatch; a bound quantization removes the other
  * dequantizers without changing the tile arithmetic. */
 constant uint qwen4_moe_weight_type [[function_constant(900)]];
+constant uint qwen4_moe_tail_base [[function_constant(905)]];
 
 #define QWEN4_MM_ROWS 32
 #define QWEN4_MM_TOKS 8
@@ -2229,6 +2230,18 @@ kernel void kernel_qwen4_moe_mm_mid(
     const uint rb = tgpig.x, e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    uint work_count = count, work_start = 0;
+    if (qwen4_moe_tail_base) {
+        const uint remainder = count % qwen4_moe_tail_base;
+        const uint tail_tt = remainder <= 8u ? 8u : remainder <= 16u ? 16u : 32u;
+        if (TT < qwen4_moe_tail_base) {
+            if (!remainder || tail_tt != TT) return;
+            work_start = count - remainder;
+            work_count = remainder;
+        } else if (remainder && tail_tt < TT) {
+            work_count = count - remainder;
+        }
+    }
     threadgroup half Ag[QWEN4_MM_ROWS * QWEN4_MM_KS];
     threadgroup half Au[QWEN4_MM_ROWS * QWEN4_MM_KS];
     threadgroup half Bs[QWEN4_MM_KS * TT];
@@ -2238,9 +2251,9 @@ kernel void kernel_qwen4_moe_mm_mid(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
-    for (uint tile = tgpig.z; tile * TT < count; tile += args.tiles_per_launch) {
-        const uint t0 = tile * TT;
-        const uint n_tile = min((uint)TT, count - t0);
+    for (uint tile = tgpig.z; tile * TT < work_count; tile += args.tiles_per_launch) {
+        const uint t0 = work_start + tile * TT;
+        const uint n_tile = min((uint)TT, work_count - tile * TT);
         simdgroup_float8x8 Cg[NT], Cu[NT];
         for (uint nt = 0; nt < NT; nt++) {
             Cg[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -2335,6 +2348,18 @@ kernel void kernel_qwen4_moe_mm_down(
     const uint rb = tgpig.x, e = tgpig.y;
     if (e >= args.n_expert) return;
     const uint count = (uint)counts[e];
+    uint work_count = count, work_start = 0;
+    if (qwen4_moe_tail_base) {
+        const uint remainder = count % qwen4_moe_tail_base;
+        const uint tail_tt = remainder <= 8u ? 8u : remainder <= 16u ? 16u : 32u;
+        if (TT < qwen4_moe_tail_base) {
+            if (!remainder || tail_tt != TT) return;
+            work_start = count - remainder;
+            work_count = remainder;
+        } else if (remainder && tail_tt < TT) {
+            work_count = count - remainder;
+        }
+    }
     threadgroup half As[QWEN4_MM_ROWS * QWEN4_MM_KS];
     threadgroup half Bs[QWEN4_MM_KS * TT];
     threadgroup float Cs[4][64];
@@ -2342,9 +2367,9 @@ kernel void kernel_qwen4_moe_mm_down(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
-    for (uint tile = tgpig.z; tile * TT < count; tile += args.tiles_per_launch) {
-        const uint t0 = tile * TT;
-        const uint n_tile = min((uint)TT, count - t0);
+    for (uint tile = tgpig.z; tile * TT < work_count; tile += args.tiles_per_launch) {
+        const uint t0 = work_start + tile * TT;
+        const uint n_tile = min((uint)TT, work_count - tile * TT);
         simdgroup_float8x8 C[NT];
         for (uint nt = 0; nt < NT; nt++) C[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         const uint my_tok = tid % TT;

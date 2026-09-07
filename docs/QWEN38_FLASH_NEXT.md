@@ -65,18 +65,23 @@ For the padded Q2_K-down build, the 640 live activation values use a
 768-value physical weight row; padding is skipped without changing the
 activation layout. On M3 Ultra, IQ2_XXS and Q2_K expert decode specializes
 the quantization and logical width and uses one row per SIMD group, with
-eight SIMD groups per threadgroup. Set `DS4_QWEN4_MOE_MV_SPECIALIZE=0` to
+eight SIMD groups per threadgroup for IQ2_XXS and sixteen for Q2_K.
+Set `DS4_QWEN4_MOE_MV_SPECIALIZE=0` to
 restore generic decode. `DS4_QWEN4_MOE_MV_NR` (1, 2 or 4) and
-`DS4_QWEN4_MOE_MV_NSG` (1 through 8) allow explicit geometry comparisons.
+`DS4_QWEN4_MOE_MV_NSG` (1 through 16) allow explicit geometry comparisons.
 
 For these low-bit expert formats on M3 Ultra, prefill uses 8-token tiles
 through 512-token batches, 16-token tiles through 1024, and 32-token tiles
 for larger batches. This avoids unused matrix products when few tokens
-route to each expert. The K accumulation order is unchanged.
+route to each expert. A final partial expert tile uses eight or sixteen
+tokens when that is sufficient, with disjoint launches for the full tiles
+and the remainder. The K accumulation order is unchanged.
 `DS4_QWEN4_MOE_MID_NT=4 DS4_QWEN4_MOE_DOWN_NT=4` restores the original
-prefill tiles; each override accepts 1, 2 or 4 groups of eight tokens.
+prefill tile width; each override accepts 1, 2 or 4 groups of eight tokens.
+Also set `DS4_QWEN4_MOE_TAILS=0` to disable the smaller remainder tiles.
 Other devices and quantizations retain their previous default geometry.
 See [the padded Q2 speed measurements](../speed-bench/qwen38-q2-speed.md)
+and [the second optimization round](../speed-bench/qwen38-q2-round2.md)
 for end-to-end timings and numerical checks.
 
 The older recipes below keep PLE inside the main GGUF, so their file sizes
