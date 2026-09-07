@@ -21,8 +21,11 @@ enum {
 
 typedef struct {
     const char *model_path;
+    const char *ple_path;
     const char *prompt_path;
     const char *candidate_env;
+    const char *candidate_value;
+    int prefill_chunk;
     int prefix_tokens;
     int initial_tokens;
     int warmup_tokens;
@@ -41,8 +44,11 @@ static void usage(FILE *fp, const char *argv0) {
             "usage: %s --candidate-env NAME [options]\n"
             "\n"
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
+            "  --ple PATH             optional PLE sidecar\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
-            "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
+            "  --candidate-env NAME   unset NAME for control, set it for candidate\n"
+            "  --candidate-value TEXT candidate env value (default: 1)\n"
+            "  --prefill-chunk N      tokens per chunk (default: 4096)\n"
             "  --prefix-tokens N      final prefill length (default: 8192)\n"
             "  --initial-tokens N     untimed live prefix before appending to that length\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
@@ -80,6 +86,8 @@ static bench_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
+        .candidate_value = "1",
+        .prefill_chunk = 4096,
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,
         .warmup_tokens = DEFAULT_WARMUP_TOKENS,
         .ctx = 0,
@@ -95,6 +103,12 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
             cfg.prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ple")) {
+            cfg.ple_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--candidate-value")) {
+            cfg.candidate_value = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            cfg.prefill_chunk = parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
         } else if (!strcmp(arg, "--candidate-env")) {
             cfg.candidate_env = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prefix-tokens")) {
@@ -194,7 +208,7 @@ static int select_variant(const bench_config *cfg, int variant) {
     const int env_rc =
         variant == 0
             ? unsetenv(cfg->candidate_env)
-            : setenv(cfg->candidate_env, "1", 1);
+            : setenv(cfg->candidate_env, cfg->candidate_value, 1);
     if (env_rc != 0) {
         fprintf(stderr,
                 "%s: failed to select %s with %s: %s\n",
@@ -297,9 +311,10 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .ple_path = cfg.ple_path,
         .backend = DS4_BACKEND_METAL,
         .context_size = cfg.ctx,
-        .prefill_chunk = 4096,
+        .prefill_chunk = (uint32_t)cfg.prefill_chunk,
         .power_percent = 100,
         .warm_weights = true,
     };
@@ -341,7 +356,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "%s: model=%s prompt=%s prefix=%d initial=%d warmup=%d ctx=%d repeats=%d "
-            "candidate_env=%s\n",
+            "candidate_env=%s candidate_value=%s prefill_chunk=%d\n",
             BENCH_NAME,
             cfg.model_path,
             cfg.prompt_path,
@@ -350,7 +365,9 @@ int main(int argc, char **argv) {
             cfg.warmup_tokens,
             cfg.ctx,
             cfg.repeats,
-            cfg.candidate_env);
+            cfg.candidate_env,
+            cfg.candidate_value,
+            cfg.prefill_chunk);
 
     for (int variant = 0; variant < VARIANT_COUNT; variant++) {
         err[0] = '\0';

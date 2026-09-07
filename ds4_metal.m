@@ -47394,6 +47394,12 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_bias_act",
 };
 
+typedef struct {
+    uint32_t n_tokens, n_slots, n_out, in_dim, out_rows, weight_type, row_bytes, list_cap;
+    uint64_t expert_bytes;
+    uint32_t n_expert, tiles_per_launch, pad0, pad1;
+} qwen4_moe_mm_args;
+
 static id<MTLComputePipelineState> g_qwen4_pipelines[QWEN4_K_COUNT];
 #define QWEN4_ATTN_NSG 4
 #define QWEN4_ATTN_MAX_SPLITS 64
@@ -47403,15 +47409,47 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
                           MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
-        if (!g_qwen4_pipelines[kernel]) {
-            g_qwen4_pipelines[kernel] = ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
-            if (!g_qwen4_pipelines[kernel]) return 0;
+        id<MTLComputePipelineState> pipeline = nil;
+        if (kernel == QWEN4_K_MOE_MM_MID || kernel == QWEN4_K_MOE_MM_DOWN) {
+            /* Keep each quantization's dequantizer constant through the K
+             * loop. M3 Ultra has balanced full-model measurements; other
+             * devices can opt in, and zero restores the generic kernel. */
+            const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
+            const bool specialize = override >= 0 ? override != 0 :
+                ds4_gpu_device_name_contains("M3 Ultra");
+            const uint32_t type = specialize ?
+                ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
+            if (type >= 40u) return 0;
+            NSString *key = [NSString stringWithFormat:@"%s_type=%u",
+                             qwen4_kernel_names[kernel], type];
+            pipeline = [g_pipeline_cache objectForKey:key];
+            if (!pipeline) {
+                MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+                [constants setConstantValue:&type type:MTLDataTypeUInt atIndex:900];
+                NSError *error = nil;
+                id<MTLFunction> fn = [g_library newFunctionWithName:
+                    [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
+                    constantValues:constants error:&error];
+                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (!pipeline) {
+                    fprintf(stderr, "ds4: Qwen MoE pipeline failed: %s\n",
+                            [[error localizedDescription] UTF8String]);
+                    return 0;
+                }
+                [g_pipeline_cache setObject:pipeline forKey:key];
+            }
+        } else {
+            if (!g_qwen4_pipelines[kernel]) {
+                g_qwen4_pipelines[kernel] = ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
+                if (!g_qwen4_pipelines[kernel]) return 0;
+            }
+            pipeline = g_qwen4_pipelines[kernel];
         }
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_qwen4_pipelines[kernel]];
+        [enc setComputePipelineState:pipeline];
         [enc setBytes:args length:args_len atIndex:0];
         for (int i = 0; i < n_binds; i++) {
             [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
@@ -48071,12 +48109,6 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
     return qwen4_dispatch(QWEN4_K_MOE_REDUCE, &args, sizeof(args), b, 7,
                           MTLSizeMake((dim + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
-
-typedef struct {
-    uint32_t n_tokens, n_slots, n_out, in_dim, out_rows, weight_type, row_bytes, list_cap;
-    uint64_t expert_bytes;
-    uint32_t n_expert, tiles_per_launch, pad0, pad1;
-} qwen4_moe_mm_args;
 
 int ds4_gpu_qwen4_moe_build_lists_tensor(
         ds4_gpu_tensor *lists, ds4_gpu_tensor *counts, const ds4_gpu_tensor *selected,

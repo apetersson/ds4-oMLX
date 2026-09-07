@@ -2044,6 +2044,10 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint32_t pad1;
 };
 
+/* Zero retains runtime dispatch; a bound quantization removes the other
+ * dequantizers without changing the tile arithmetic. */
+constant uint qwen4_moe_weight_type [[function_constant(900)]];
+
 #define QWEN4_MM_ROWS 32
 #define QWEN4_MM_TOKS 8
 
@@ -2237,8 +2241,9 @@ kernel void kernel_qwen4_moe_mm_mid(
                     device const char *grow = gbase + (uint64_t)(row0 + r) * args.row_bytes;
                     device const char *urow = ubase + (uint64_t)(row0 + r) * args.row_bytes;
                     const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
-                    qwen4_mm_stage16(grow, b, quarter0, args.weight_type, dg);
-                    qwen4_mm_stage16(urow, b, quarter0, args.weight_type, du);
+                    const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
+                    qwen4_mm_stage16(grow, b, quarter0, type, dg);
+                    qwen4_mm_stage16(urow, b, quarter0, type, du);
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
@@ -2323,7 +2328,8 @@ kernel void kernel_qwen4_moe_mm_down(
                 if (row0 + r < args.out_rows) {
                     device const char *drow = dbase + (uint64_t)(row0 + r) * args.row_bytes;
                     const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
-                    qwen4_mm_stage16(drow, b, quarter0, args.weight_type, dd);
+                    const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
+                    qwen4_mm_stage16(drow, b, quarter0, type, dd);
                 } else {
                     for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
                 }
