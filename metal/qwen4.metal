@@ -27,6 +27,36 @@ static inline float qwen4_silu(float x) {
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg);
 
+static inline float qwen4_load_half(device const uchar *p) { return (float)(*(device const half *)p); }
+static inline float qwen4_extra_quant(device const uchar *p, uint type, uint64_t i) {
+    if (type == 7u) {
+        p += (i / 32u) * 24u; const uint j = i % 32u;
+        const uint high = (p[4u + j / 8u] >> (j % 8u)) & 1u;
+        const uint low = (p[8u + j % 16u] >> (j < 16u ? 0u : 4u)) & 15u;
+        return qwen4_load_half(p) * (float)(low | (high << 4)) + qwen4_load_half(p + 2);
+    }
+    if (type == 20u) {
+        p += (i / 32u) * 18u; const uint j = i % 32u;
+        const int values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+        return qwen4_load_half(p) * (float)values[(p[2u + j % 16u] >> (j < 16u ? 0u : 4u)) & 15u];
+    }
+    if (type == 13u) {
+        p += (i / 256u) * 176u; const uint j = i % 256u, g = j / 32u, l = j % 32u;
+        device const uchar * sc = p + 4; uint s, mn;
+        if (g < 4u) { s = sc[g] & 63u; mn = sc[g+4] & 63u; }
+        else { s = (sc[g+4] & 15u) | ((sc[g-4] & 192u) >> 2); mn = (sc[g+4] >> 4) | ((sc[g] & 192u) >> 2); }
+        const uint q = ((p[48u + (g/2u)*32u + l] >> ((g&1u)*4u)) & 15u) | (((p[16u+l] >> g)&1u)<<4);
+        return qwen4_load_half(p) * (float)s * (float)q - qwen4_load_half(p+2) * (float)mn;
+    }
+    if (type == 14u) {
+        p += (i / 256u) * 210u; const uint j = i % 256u, h = j/128u, l = j%32u, g = (j%128u)/32u;
+        const uint lo = (p[h*64u + (g%2u)*32u + l] >> (g < 2u ? 0u : 4u)) & 15u;
+        const uint hi = (p[128u + h*32u + l] >> (2u*g)) & 3u;
+        const int scale = (int)(char)p[192u + h*8u + 2u*g + l/16u];
+        return qwen4_load_half(p+208) * (float)scale * (float)((int)(lo | (hi<<4))-32);
+    }
+ return 0.0f; }
+
 /* --- hyper-connections -------------------------------------------------- */
 
 struct ds4_metal_args_qwen4_hc_norm {
@@ -45,18 +75,21 @@ struct ds4_metal_args_qwen4_hc_norm {
 /* element readers for the hc mixer weights: f16, f32 and q8_0 rows */
 struct qwen4_w_f16 {
     device const half *p;
-    qwen4_w_f16(device const char *base) : p((device const half *)base) {}
+    qwen4_w_f16(device const char *base, uint type = 1u) : p((device const half *)base) {}
     float at(uint64_t i) const { return (float)p[i]; }
 };
 struct qwen4_w_f32 {
     device const float *p;
-    qwen4_w_f32(device const char *base) : p((device const float *)base) {}
+    qwen4_w_f32(device const char *base, uint type = 0u) : p((device const float *)base) {}
     float at(uint64_t i) const { return p[i]; }
 };
 struct qwen4_w_q8 {
     device const char *p;
-    qwen4_w_q8(device const char *base) : p(base) {}
+    uint type;
+    qwen4_w_q8(device const char *base, uint t = 8u) : p(base), type(t) {}
     float at(uint64_t i) const {
+        if (type == 30u) return as_type<float>((uint)((device const ushort *)p)[i] << 16);
+        if (type != 8u) return qwen4_extra_quant((device const uchar *)p, type, i);
         device const char *b = p + (i >> 5) * 34;
         return (float)(*(device const half *)b) * (float)b[2 + (i & 31u)];
     }
@@ -89,7 +122,7 @@ kernel void kernel_qwen4_hc_norm(
     device const float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
     device const float *g = gamma + s * E;
     device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
-    const W w(w_inject);
+    const W w(w_inject, args.pad0);
     float ss = 0.0f;
     for (uint i = tid; i < E; i += nth) ss += r[i] * r[i];
     ss = simd_sum(ss);
@@ -158,7 +191,7 @@ kernel void kernel_qwen4_hc_norm_reuse(
     device const float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
     device const float *g = gamma + s * E;
     device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
-    const W w(w_inject);
+    const W w(w_inject, args.pad0);
     float ss = 0.0f;
     for (uint i = tid; i < E; i += nth) ss += r[i] * r[i];
     ss = simd_sum(ss);
@@ -212,6 +245,7 @@ struct ds4_metal_args_qwen4_hc_gate_mix {
     uint32_t n_embd;
     uint32_t n_hc;
     uint32_t n_rank;
+    uint32_t weight_type;
 };
 
 /* mixed[d] = mean over streams of sigmoid(w_up[s*E+d] . silu(lo/hc)) *
@@ -238,7 +272,7 @@ kernel void kernel_qwen4_hc_gate_mix(
     if (d >= E || tok >= args.n_tokens) return;
     const uint s = tiisg / 8, lane = tiisg % 8;
     device const float *l = lo + (uint64_t)tok * args.n_rank;
-    const W w(w_up);
+    const W w(w_up, args.weight_type);
     const uint64_t row = (uint64_t)(s * E + d) * args.n_rank;
     float acc = 0.0f;
     for (uint r = lane; r < args.n_rank; r += 8) acc += w.at(row + r) * qwen4_silu(l[r] / (float)hc);
@@ -283,7 +317,7 @@ kernel void kernel_qwen4_hc_gate_mix_pair(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (d >= E) return;
     const uint s = tiisg / 8, lane = tiisg % 8;
-    const W w(w_up);
+    const W w(w_up, args.weight_type);
     const uint64_t row = (uint64_t)(s * E + d) * rank;
     float2 acc = 0.0f;
     for (uint r = lane; r < rank; r += 8) acc += w.at(row + r) * activated[r];
@@ -1662,7 +1696,10 @@ struct ds4_metal_args_qwen4_moe {
 static inline float qwen4_row_dot(device const char *row, device const float *x,
                                   uint weight_type, uint in_dim, ushort tiisg) {
     float acc = 0.0f;
-    if (weight_type == 8) {
+    if (weight_type == 7u || weight_type == 13u || weight_type == 14u || weight_type == 20u) {
+        for (uint i = tiisg; i < in_dim; i += 32u)
+            acc += qwen4_extra_quant((device const uchar *)row, weight_type, i) * x[i];
+    } else if (weight_type == 8) {
         const short ix = tiisg / 8, it = tiisg % 8;
         const uint nb = in_dim / 32;
         for (uint ib = (uint)ix; ib < nb; ib += 4) {

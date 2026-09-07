@@ -2265,7 +2265,7 @@ static const gguf_type_info gguf_types[] = {
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
     [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2283,6 +2283,8 @@ enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q5_1     = 7,
+    DS4_TENSOR_IQ4_NL   = 20,
     DS4_TENSOR_Q4_1     = 3,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
@@ -5257,14 +5259,15 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
 /* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q5_1 ||
+           type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_IQ4_NL;
 }
 
 static void tensor_expect_qwen4_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen4_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected a supported Qwen dense quantization\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -5276,7 +5279,7 @@ static void tensor_expect_qwen4_expert_layout(
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
         t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0) {
+        t->type != DS4_TENSOR_Q4_0 && t->type != DS4_TENSOR_IQ4_NL) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -5311,7 +5314,7 @@ static void weights_validate_qwen4_layout(
     if (require_token_embd && !w->ple_embd) ds4_die("required per_layer_token_embd tensor is missing");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_F32 && t != DS4_TENSOR_F16 && t != DS4_TENSOR_Q8_0 &&
+        if (t != DS4_TENSOR_BF16 && t != DS4_TENSOR_F32 && t != DS4_TENSOR_F16 && t != DS4_TENSOR_Q8_0 &&
             t != DS4_TENSOR_MXFP4 && t != DS4_TENSOR_Q4_0 &&
             !(t == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
             fprintf(stderr, "ds4: per_layer_token_embd has unsupported type %u\n", t);
@@ -7538,7 +7541,10 @@ static void weights_bind(
         w->ple_embd = (require_token_embd && !m->ple_model) ?
             required_tensor(m, "per_layer_token_embd.weight") :
             model_find_tensor(m, "per_layer_token_embd.weight");
-        if (m->ple_model) w->ple_embd = required_tensor(m->ple_model, "ple.weight");
+        if (m->ple_model) {
+            w->ple_embd = model_find_tensor(m->ple_model, "ple.weight");
+            if (!w->ple_embd) w->ple_embd = required_tensor(m->ple_model, "per_layer_token_embd.weight");
+        }
     }
     weights_bind_output(w, m, require_output, optional_output);
 
@@ -54749,6 +54755,37 @@ static int generate_glm_metal_argmax(
 }
 #endif
 
+/* Decode standard GGML blocks without requantizing the checkpoint.
+ * This scalar path also supplies the CPU-only token/PLE embedding gather. */
+static float qwen4_load_half(const uint8_t *p) { uint16_t h; memcpy(&h,p,2); return f16_to_f32(h); }
+static float qwen4_extra_quant(const uint8_t *p, uint32_t type, uint64_t i) {
+    if (type == 7u) {
+        p += (i / 32u) * 24u; const uint32_t j = i % 32u;
+        const uint32_t high = (p[4u + j / 8u] >> (j % 8u)) & 1u;
+        const uint32_t low = (p[8u + j % 16u] >> (j < 16u ? 0u : 4u)) & 15u;
+        return qwen4_load_half(p) * (float)(low | (high << 4)) + qwen4_load_half(p + 2);
+    }
+    if (type == 20u) {
+        p += (i / 32u) * 18u; const uint32_t j = i % 32u;
+        const int values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+        return qwen4_load_half(p) * (float)values[(p[2u + j % 16u] >> (j < 16u ? 0u : 4u)) & 15u];
+    }
+    if (type == 13u) {
+        p += (i / 256u) * 176u; const uint32_t j = i % 256u, g = j / 32u, l = j % 32u;
+        const uint8_t * sc = p + 4; uint32_t s, mn;
+        if (g < 4u) { s = sc[g] & 63u; mn = sc[g+4] & 63u; }
+        else { s = (sc[g+4] & 15u) | ((sc[g-4] & 192u) >> 2); mn = (sc[g+4] >> 4) | ((sc[g] & 192u) >> 2); }
+        const uint32_t q = ((p[48u + (g/2u)*32u + l] >> ((g&1u)*4u)) & 15u) | (((p[16u+l] >> g)&1u)<<4);
+        return qwen4_load_half(p) * (float)s * (float)q - qwen4_load_half(p+2) * (float)mn;
+    }
+    if (type == 14u) {
+        p += (i / 256u) * 210u; const uint32_t j = i % 256u, h = j/128u, l = j%32u, g = (j%128u)/32u;
+        const uint32_t lo = (p[h*64u + (g%2u)*32u + l] >> (g < 2u ? 0u : 4u)) & 15u;
+        const uint32_t hi = (p[128u + h*32u + l] >> (2u*g)) & 3u;
+        const int scale = (int)(int8_t)p[192u + h*8u + 2u*g + l/16u];
+        return qwen4_load_half(p+208) * (float)scale * (float)((int)(lo | (hi<<4))-32);
+    }
+ return 0.0f; }
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
@@ -54883,20 +54920,18 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
 }
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
-    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+    return t && tensor_type_is_qwen4_dense(t->type);
 }
 
-/* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS;
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
-    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_IQ4_NL ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
-                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
+                 ((t->type == DS4_TENSOR_Q5_K || t->type == DS4_TENSOR_Q6_K || t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0));
 }
 
@@ -54904,15 +54939,15 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
-        fprintf(stderr, "ds4: Qwen3.8 Metal graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
+        fprintf(stderr, "ds4: Qwen3.8 Metal graph needs supported Qwen dense weights\n");
         return false;
     }
-    if (w->ple_embd->type != DS4_TENSOR_F32 && w->ple_embd->type != DS4_TENSOR_F16 &&
+    if (w->ple_embd->type != DS4_TENSOR_BF16 && w->ple_embd->type != DS4_TENSOR_F32 && w->ple_embd->type != DS4_TENSOR_F16 &&
         w->ple_embd->type != DS4_TENSOR_Q8_0 && w->ple_embd->type != DS4_TENSOR_Q4_0 &&
         w->ple_embd->type != DS4_TENSOR_MXFP4 &&
         !(w->ple_embd->type == DS4_TENSOR_Q4_1 && g_ds4_ple_sidecar)) {
         fprintf(stderr,
-                "ds4: Qwen3.8 Metal graph needs a F32/F16/Q8_0/Q4_0/MXFP4 n-gram table "
+                "ds4: Qwen3.8 Metal graph needs a BF16/F32/F16/Q8_0/Q4_0/MXFP4 n-gram table "
                 "(or a Q4_1 --ple sidecar)\n");
         return false;
     }
@@ -54931,8 +54966,8 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *hc[4] = { l->hc_attn_up, l->hc_attn_inject, l->hc_ffn_up, l->hc_ffn_inject };
         for (int i = 0; i < 4; i++) {
-            if (hc[i]->type != DS4_TENSOR_F16 && hc[i]->type != DS4_TENSOR_F32 && hc[i]->type != DS4_TENSOR_Q8_0) {
-                fprintf(stderr, "ds4: Qwen3.8 Metal graph needs F16/F32/Q8_0 hc up/inject weights (layer %u)\n", il);
+            if (!qwen4_graph_dense_ok(hc[i]) || hc[i]->type == DS4_TENSOR_Q4_0) {
+                fprintf(stderr, "ds4: Qwen3.8 Metal graph has unsupported hc up/inject weights (layer %u)\n", il);
                 return false;
             }
         }
@@ -55149,6 +55184,10 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q5_1:
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_Q6_K:
+    case DS4_TENSOR_IQ4_NL:
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
@@ -63218,6 +63257,15 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
+    case DS4_TENSOR_Q5_1:
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_Q6_K:
+    case DS4_TENSOR_IQ4_NL: {
+        uint64_t bytes; if (!tensor_nbytes(t->type,n,&bytes)) ds4_die("invalid Qwen row type");
+        const uint8_t *p = (const uint8_t *)tensor_data(m,t) + row*bytes;
+        for (uint64_t i=0;i<n;i++) out[i]=qwen4_extra_quant(p,t->type,i);
+        break;
+    }
     case DS4_TENSOR_F32:
         memcpy(out, (const float *)tensor_data(m, t) + row * n, n * sizeof(float));
         break;
@@ -66769,10 +66817,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         /* CPU-only private mapping: the PLE gather runs on the host, so the
          * sidecar never joins a Metal view or the main residency map. */
-        model_open(&e->ple_model, opt->ple_path, false, true);
+        /* Sparse rows must not trigger a full-table WILLNEED prefetch. */
+        model_open(&e->ple_model, opt->ple_path, false, false);
         const ds4_tensor *ple_t = model_find_tensor(&e->ple_model, "ple.weight");
+        if (!ple_t) ple_t = model_find_tensor(&e->ple_model, "per_layer_token_embd.weight");
         if (!ple_t) {
-            fprintf(stderr, "ds4: --ple sidecar %s has no ple.weight tensor\n",
+            fprintf(stderr, "ds4: --ple sidecar %s has neither ple.weight nor per_layer_token_embd.weight\n",
                     opt->ple_path);
             ds4_engine_close(e);
             *out = NULL;

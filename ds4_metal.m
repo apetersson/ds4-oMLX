@@ -47517,8 +47517,11 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
 }
 
 /* bytes of one hc mixer row of n elements: f16, f32 or q8_0 */
+static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim);
 static uint64_t qwen4_hc_row_bytes(uint32_t weight_type, uint64_t n) {
-    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 8u ? (n / 32u) * 34u : 0u;
+    if (weight_type == 0u) return n*4u;
+    if (weight_type == 1u || weight_type == 30u) return n*2u;
+    return n > UINT32_MAX ? 0u : qwen4_expert_row_bytes(weight_type, (uint32_t)n);
 }
 
 static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8) {
@@ -47528,6 +47531,10 @@ static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8) {
 static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     if (in_dim == 0 || (in_dim % 32u) != 0) return 0;
     switch (weight_type) {
+    case 7u: return (in_dim / 32u) * 24u;
+    case 20u: return (in_dim / 32u) * 18u;
+    case 13u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 176u;
+    case 14u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 210u;
     case 8u:  return (in_dim / 32u) * 34u;   /* q8_0 */
     case 12u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 144u;   /* q4_K */
     case 10u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 84u;    /* q2_K */
@@ -47548,7 +47555,7 @@ int ds4_gpu_qwen4_hc_norm_tensor(
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, dim);
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
-        { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
+        { n_tokens, n_embd, n_hc, n_inject, eps, weight_type, 0, 0 };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
         !qwen4_bind_tensor(&b[0], R, n_tokens * dim * sizeof(float), "hc norm input") ||
@@ -47592,7 +47599,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank) {
     const uint64_t dim = (uint64_t)n_embd * n_hc;
     const uint64_t wrow = qwen4_hc_row_bytes(weight_type, n_rank);
-    struct { uint32_t n_tokens, n_embd, n_hc, n_rank; } args = { n_tokens, n_embd, n_hc, n_rank };
+    struct { uint32_t n_tokens, n_embd, n_hc, n_rank, weight_type; } args = { n_tokens, n_embd, n_hc, n_rank, weight_type };
     qwen4_bind b[4];
     if (n_tokens == 0 || n_hc != 4 || (n_rank % 4) != 0 || wrow == 0 || (weight_type == 8u && (n_rank % 32) != 0) ||
         !qwen4_bind_tensor(&b[0], xn, n_tokens * dim * sizeof(float), "hc gate input") ||

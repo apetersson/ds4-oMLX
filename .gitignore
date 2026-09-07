@@ -61,3 +61,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+
+/tests/test_qwen4_extra_quants
+/tests/test_qwen4_extra_quants_cpu
+/tests/.qwen4-extra-fixtures/
