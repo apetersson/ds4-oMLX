@@ -7084,3 +7084,41 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// Independently defined residual-mean intervention, not publisher GLP semantics.
+// Capture mean(x[0:4]) before removing the same directional component from
+// every stream. Stream differences therefore survive the intervention.
+struct ds41_residual_args {
+    uint32_t width, rows, layer, n_threads, capture_row;
+    float scale;
+};
+kernel void kernel_ds41_residual_mean_equal(
+        constant ds41_residual_args &a,
+        device float *x,
+        device const float *directions,
+        device float *capture,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    device float *xr = x + (uint64_t)row * 4 * a.width;
+    device const float *d = directions + (uint64_t)a.layer * a.width;
+    float dot = 0;
+    for (uint j = tid; j < a.width; j += a.n_threads) {
+        float mean = ((xr[j] + xr[a.width+j]) +
+                      (xr[2*a.width+j] + xr[3*a.width+j])) * 0.25f;
+        if (row == a.capture_row) capture[j] = mean;
+        if (a.scale != 0) dot += mean * d[j];
+    }
+    scratch[tid] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = a.n_threads >> 1; step; step >>= 1) {
+        if (tid < step) scratch[tid] += scratch[tid+step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Skip all stores at zero strength: even signed zeros remain unchanged.
+    if (a.scale != 0) {
+        float coefficient = a.scale * scratch[0];
+        for (uint j = tid; j < a.width; j += a.n_threads)
+            for (uint h = 0; h < 4; h++) xr[h*a.width+j] -= coefficient*d[j];
+    }
+}

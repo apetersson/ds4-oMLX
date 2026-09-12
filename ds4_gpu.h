@@ -2524,6 +2524,12 @@ int ds4_gpu_add3_tensor(
         const ds4_gpu_tensor *c,
         uint32_t                n);
 
+/* Metal-only V4.1 research hook; capture_row >= rows disables capture. */
+int ds4_gpu_ds41_residual_mean_equal(ds4_gpu_tensor *x,
+    const ds4_gpu_tensor *directions, ds4_gpu_tensor *capture,
+    uint32_t layer, uint32_t width, uint32_t rows, uint32_t capture_row,
+    float scale);
+
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,

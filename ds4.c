@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_v41_intervention.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -39150,6 +39151,15 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
 typedef struct {
+    ds4_gpu_tensor *directions, *capture;
+    uint64_t layers, capture_layers, captured;
+    uint32_t capture_pos, site;
+    unsigned char model_sha256[32];
+    float alpha;
+} ds41_intervention;
+
+typedef struct {
+    ds41_intervention *intervention;
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
@@ -39186,6 +39196,11 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    if (g->intervention) {
+        ds4_gpu_tensor_free(g->intervention->directions);
+        ds4_gpu_tensor_free(g->intervention->capture);
+        free(g->intervention);
+    }
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -39266,6 +39281,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
+    if (g->intervention) g->intervention->captured = 0;
     g->pos = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
@@ -39549,6 +39565,57 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
+/* Capture is pre-intervention, after any tensor-parallel partial sums. GPU
+ * copies avoid synchronizing each layer; only the requested absolute token
+ * is retained. State is shared by temporary row views of the same session. */
+static bool ds41_writer_hook(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                             uint32_t layer, uint32_t start, uint32_t rows) {
+    ds41_intervention *v = g->intervention;
+    if (!v || v->site != DS41_SITE_WRITER) return true;
+    const uint64_t bit = UINT64_C(1) << layer;
+    if (v->capture && (v->capture_layers & bit) &&
+        v->capture_pos >= start && v->capture_pos - start < rows) {
+        if (v->captured & bit) return false;
+        const uint64_t bytes = DS41_DIRECTION_WIDTH * sizeof(float);
+        if (!ds4_gpu_tensor_copy(v->capture, layer * bytes, x,
+                (v->capture_pos - start) * bytes, bytes)) return false;
+        v->captured |= bit;
+    }
+    return !v->directions || v->alpha == 0 || !(v->layers & bit) ||
+        ds4_gpu_directional_steering_project_tensor(x, v->directions,
+            layer, DS41_DIRECTION_WIDTH, rows, v->alpha);
+}
+
+static bool ds41_residual_hook(ds41_gpu_graph *g, ds4_gpu_tensor *x,
+                               uint32_t layer, uint32_t start, uint32_t rows) {
+    ds41_intervention *v = g->intervention;
+    if (!v || v->site != DS41_SITE_RESIDUAL_MEAN_EQUAL) return true;
+    const uint64_t bit = UINT64_C(1) << layer;
+    uint32_t capture_row = UINT32_MAX;
+    ds4_gpu_tensor *capture = NULL;
+    if (v->capture && (v->capture_layers & bit) &&
+        v->capture_pos >= start && v->capture_pos - start < rows) {
+        if (v->captured & bit) return false;
+        capture_row = v->capture_pos - start;
+        capture = ds4_gpu_tensor_view(v->capture,
+            (uint64_t)layer * DS41_DIRECTION_WIDTH * sizeof(float),
+            DS41_DIRECTION_WIDTH * sizeof(float));
+        if (!capture) return false;
+    }
+    const float scale = (v->layers & bit) ? v->alpha : 0;
+    bool ok = (!capture && scale == 0) ||
+        ds4_gpu_ds41_residual_mean_equal(x, v->directions, capture,
+            layer, DS41_DIRECTION_WIDTH, rows, capture_row, scale);
+    if (ok && capture) v->captured |= bit;
+    ds4_gpu_tensor_free(capture);
+    /* Compact wide-prefill carry stores BF16. Round edited residuals here in
+     * every path so crossing a carry tile does not add a semantic boundary.
+     * Zero strength skips both the edit and this extra rounding. */
+    if (ok && scale != 0)
+        ok = ds4_gpu_dsv41_quantize(x, DS41_DIRECTION_WIDTH * 4, rows, DS4_V41_BF16);
+    return ok;
+}
+
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
@@ -39667,6 +39734,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
+           ds41_writer_hook(g, g->block, il, g->pos, 1) &&
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
@@ -40114,7 +40182,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
-        if (ok) ok = ds41_graph_layer(g, m, l, il, token);
+        if (ok) ok = ds41_graph_layer(g, m, l, il, token) &&
+            ds41_residual_hook(g, g->residual, il, g->pos, 1);
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
@@ -40636,13 +40705,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                         g->batch.heads, count, g->tp_rank) &&
-                        ds41_sum_partial_batch(g, g->batch.block, il, count) &&
-                        ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
+                        ds41_sum_partial_batch(g, g->batch.block, il, count);
                 } else if (ok && l->attn_output_b->type == DS4_TENSOR_Q8_0) {
                     ok = ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-                        g->batch.heads, count) &&
-                        ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
+                        g->batch.heads, count);
                 } else if (ok) {
                     for (uint32_t t = 0; ok && t < count; t++) {
                         row.heads = g->rows_view[t].heads;
@@ -40650,8 +40717,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ok = ds41_attention_low(&row, m, l);
                     }
                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
-                                                   g->batch.low, count, true);
+                                                   g->batch.low, count, false);
                 }
+                if (ok) ok = ds41_writer_hook(g, g->batch.block, il, start, count) &&
+                    ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
                 DS41_STAGE("attention output");
                 if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
                 DS41_STAGE("hc/ffn norm");
@@ -40683,6 +40752,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
                 }
             }
+            if (ok) ok = ds41_residual_hook(g, g->batch.residual, il, start, count);
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
             if (ok && wide && il + 1u < DS4_N_LAYER) {
@@ -40828,6 +40898,8 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
                 ds41_attention_output(&row, model, l);
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
+        for (int i = 0; ok && i < count; i++)
+            ok = ds41_writer_hook(graphs[i], g->rows_view[i].block, il, positions[i], 1);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
@@ -40838,6 +40910,8 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        for (int i = 0; ok && i < count; i++)
+            ok = ds41_residual_hook(graphs[i], g->rows_view[i].residual, il, positions[i], 1);
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
@@ -68032,6 +68106,116 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
         return -1;
     }
     return ds4_dist_session_route_ready(s->distributed, err, errlen);
+}
+
+/* The caller verifies the full model digest before supplying it here. This
+ * allows a resident controller to hash the large model once, not per arm.
+ * Configuration is restricted to an empty graph to prevent mixed KV state. */
+int ds4_session_v41_configure(ds4_session *s, const char *path,
+        const unsigned char model_sha256[32], uint32_t site, float alpha,
+        uint32_t capture_pos, uint64_t capture_layers) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    uint32_t bits;
+    memcpy(&bits, &alpha, sizeof(bits));
+    volatile uint32_t alpha_bits = bits;
+    if (!s || !model_sha256 || !s->ds41_graph_ready || s->distributed || s->engine->tp.active ||
+        s->ds41_graph.pos || !ds41_bits_finite(alpha_bits) ||
+        (site != DS41_SITE_WRITER && site != DS41_SITE_RESIDUAL_MEAN_EQUAL) ||
+        capture_layers >> DS41_DIRECTION_LAYERS ||
+        (capture_layers && capture_pos >= (uint32_t)s->ctx_size) ||
+        (!path && alpha != 0)) return 1;
+    ds41_intervention *v = calloc(1, sizeof(*v));
+    if (!v) return 1;
+    bool ok = true;
+    if (path) {
+        ds41_direction *d = malloc(sizeof(*d));
+        FILE *f = fopen(path, "rb");
+        const char *error = NULL;
+        ok = d && ds41_direction_read(f, model_sha256, d, &error);
+        if (f) fclose(f);
+        if (ok) ok = d->site == site;
+        if (ok) {
+            v->directions = ds4_gpu_tensor_alloc(sizeof(d->values));
+            ok = v->directions && ds4_gpu_tensor_write(v->directions, 0, d->values, sizeof(d->values));
+            v->layers = d->layers;
+        }
+        if (!ok) fprintf(stderr, "ds4: V4.1 direction rejected: %s\n",
+                         error ? error : "unsupported site or allocation failure");
+        free(d);
+    }
+    if (ok && capture_layers) {
+        v->capture = ds4_gpu_tensor_alloc(DS41_DIRECTION_VALUES * sizeof(float));
+        ok = v->capture != NULL;
+    }
+    if (!ok) {
+        ds4_gpu_tensor_free(v->directions); ds4_gpu_tensor_free(v->capture); free(v);
+        return 1;
+    }
+    memcpy(v->model_sha256, model_sha256, 32);
+    v->site = site; v->alpha = alpha; v->capture_pos = capture_pos; v->capture_layers = capture_layers;
+    ds41_intervention *old = s->ds41_graph.intervention;
+    s->ds41_graph.intervention = v;
+    if (old) {
+        ds4_gpu_tensor_free(old->directions); ds4_gpu_tensor_free(old->capture); free(old);
+    }
+    return 0;
+#else
+    (void)s; (void)path; (void)model_sha256; (void)site; (void)alpha; (void)capture_pos; (void)capture_layers;
+    return 1;
+#endif
+}
+
+int ds4_session_v41_writer_configure(ds4_session *s, const char *path,
+        const unsigned char model_sha256[32], float alpha,
+        uint32_t capture_pos, uint64_t capture_layers) {
+    return ds4_session_v41_configure(s, path, model_sha256, DS41_SITE_WRITER,
+                                    alpha, capture_pos, capture_layers);
+}
+
+int ds4_session_v41_capture(ds4_session *s, float *values, size_t count,
+                            ds4_v41_capture_info *info) {
+    if (info) memset(info, 0, sizeof(*info));
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!s || !s->ds41_graph_ready || !values || count != DS41_DIRECTION_VALUES || !info)
+        return 1;
+    memset(values, 0, count * sizeof(float));
+    ds41_intervention *v = s->ds41_graph.intervention;
+    if (!v || !v->capture || v->captured != v->capture_layers ||
+        !s->checkpoint_valid || !s->ds41_graph.valid ||
+        s->ds41_graph.pos <= v->capture_pos) return 1;
+    for (uint32_t l = 0; l < DS41_DIRECTION_LAYERS; l++) {
+        if (!(v->captured & (UINT64_C(1) << l))) continue;
+        if (!ds4_gpu_tensor_read(v->capture, l * DS41_DIRECTION_WIDTH * sizeof(float),
+                values + l * DS41_DIRECTION_WIDTH, DS41_DIRECTION_WIDTH * sizeof(float))) goto fail;
+    }
+    for (size_t i = 0; i < count; i++) {
+        uint32_t bits;
+        memcpy(&bits, values + i, sizeof(bits));
+        volatile uint32_t raw = bits;
+        if (!ds41_bits_finite(raw)) goto fail;
+    }
+    info->version = 1; info->layer_count = DS41_DIRECTION_LAYERS;
+    info->width = DS41_DIRECTION_WIDTH; info->site = v->site;
+    info->position = v->capture_pos; info->layers = v->captured;
+    memcpy(info->model_sha256, v->model_sha256, 32);
+    return 0;
+fail:
+    memset(values, 0, count * sizeof(float));
+    return 1;
+#else
+    (void)s; (void)values; (void)count;
+    return 1;
+#endif
+}
+
+int ds4_session_v41_writer_capture(ds4_session *s, float *values, size_t count,
+                                    uint64_t *layers) {
+    if (!layers) return 1;
+    *layers = 0;
+    ds4_v41_capture_info info;
+    int rc = ds4_session_v41_capture(s, values, count, &info);
+    if (!rc) *layers = info.layers;
+    return rc;
 }
 
 int ds4_session_power(ds4_session *s) {

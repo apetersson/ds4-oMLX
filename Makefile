@@ -355,7 +355,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_v41_intervention.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -421,7 +421,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_v41_intervention.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_prompt_prefix.h linenoise.h
@@ -857,3 +857,25 @@ clean:
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+.PHONY: test-v41-direction
+test-v41-direction:
+	$(CC) $(CFLAGS) -o /tmp/ds41-direction-test tests/test_v41_direction.c -lm
+	/tmp/ds41-direction-test
+
+# Explicit live target: invoke serially with the verified Q2 and fixture paths.
+tests/test_v41_writer_live: tests/test_v41_writer_live.c ds4.h ds4_v41_intervention.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_v41_writer_live.c $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-v41-residual-metal
+test-v41-residual-metal: $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o /tmp/test-v41-residual-metal tests/test_v41_residual_metal.c $(CORE_OBJS) $(METAL_LDLIBS)
+	/tmp/test-v41-residual-metal
+
+tests/test_v41_session_isolation: tests/test_v41_session_isolation.c ds4.h ds4_v41_intervention.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_v41_session_isolation.c $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-v41-writer-metal
+test-v41-writer-metal: $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o /tmp/test-v41-writer-metal tests/test_v41_writer_metal.c $(CORE_OBJS) $(METAL_LDLIBS)
+	/tmp/test-v41-writer-metal

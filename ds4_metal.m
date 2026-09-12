@@ -31170,6 +31170,44 @@ int ds4_gpu_directional_steering_project_tensor(
     return 1;
 }
 
+int ds4_gpu_ds41_residual_mean_equal(ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *directions, ds4_gpu_tensor *capture,
+        uint32_t layer, uint32_t width, uint32_t rows, uint32_t capture_row,
+        float scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!x || !width || !rows || layer >= 40 ||
+        (scale != 0 && !directions) || (capture_row < rows && !capture)) return 0;
+    if (ds4_gpu_tensor_bytes(x) < (uint64_t)width * rows * 4 * sizeof(float) ||
+        (directions && ds4_gpu_tensor_bytes(directions) < (uint64_t)(layer+1) * width * sizeof(float)) ||
+        (capture && ds4_gpu_tensor_bytes(capture) < (uint64_t)width * sizeof(float))) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_ds41_residual_mean_equal");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        NSUInteger nth = 1;
+        while (nth * 2 <= 256 && nth * 2 <= pipeline.maxTotalThreadsPerThreadgroup &&
+               nth * 2 <= width) nth *= 2;
+        struct { uint32_t width, rows, layer, n_threads, capture_row; float scale; } args =
+            {width, rows, layer, (uint32_t)nth, capture_row, scale};
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        // Unused pointer arguments still need valid Metal bindings.
+        const ds4_gpu_tensor *d = directions ? directions : x;
+        ds4_gpu_tensor *c = capture ? capture : x;
+        [enc setBuffer:ds4_gpu_tensor_buffer(d) offset:ds4_gpu_tensor_offset(d) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(c) offset:ds4_gpu_tensor_offset(c) atIndex:3];
+        [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 residual mean")) return 0;
+    }
+    return 1;
+}
+
 static NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipelineState> pipeline) {
     NSUInteger nth_max = pipeline.maxTotalThreadsPerThreadgroup;
     if (nth_max > 256u) nth_max = 256u;

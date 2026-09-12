@@ -397,6 +397,30 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* V4.1 intervention experiment API: caller must verify model_sha256 against the
+ * actual model. Configure only an empty session. Capture keeps one absolute
+ * token, pre-projection, in a caller-owned 40x5120 float array. Zero mask
+ * disables capture. Nonzero return means rejected/incomplete. */
+/* site 1: writer; site 2: independent residual mean/equal-stream removal,
+ * after layer BF16 rounding and before the next layer's Engram addition;
+ * nonzero residual edits are rounded back to BF16 in every execution path. */
+int ds4_session_v41_configure(ds4_session *s, const char *path,
+    const unsigned char model_sha256[32], uint32_t site, float alpha,
+    uint32_t capture_pos, uint64_t capture_layers);
+int ds4_session_v41_writer_configure(ds4_session *s, const char *path,
+    const unsigned char model_sha256[32], float alpha,
+    uint32_t capture_pos, uint64_t capture_layers);
+typedef struct {
+    uint32_t version, layer_count, width, site, position;
+    uint64_t layers;
+    unsigned char model_sha256[32];
+} ds4_v41_capture_info;
+/* Metadata and payload describe the same pre-intervention capture. The digest
+ * is the caller-verified deployment identity supplied at configuration. */
+int ds4_session_v41_capture(ds4_session *s, float *values, size_t count,
+    ds4_v41_capture_info *info);
+int ds4_session_v41_writer_capture(ds4_session *s, float *values, size_t count,
+    uint64_t *layers);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 float ds4_session_directional_steering_ffn(ds4_session *s);
