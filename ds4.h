@@ -395,6 +395,10 @@ int ds4_token_assistant(ds4_engine *e);
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
 
+/* Hash the opened deployment file with bounded memory. Available on macOS;
+ * returns nonzero on unsupported platforms, I/O failure or file mutation. */
+int ds4_engine_model_sha256(ds4_engine *e, unsigned char digest[32]);
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 /* V4.1 intervention experiment API: caller must verify model_sha256 against the

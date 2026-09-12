@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_v41_intervention.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -98,11 +99,32 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    const char *v41_direction_file;
+    bool v41_strength_set;
+    float v41_strength;
+    uint32_t v41_site;
+    unsigned char v41_digest[32];
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
 } cli_config;
+
+/* All CLI-owned sessions, including /ctx replacements, enter here.
+ * Configure before any warmup, prefix prefill or token evaluation. */
+static int cli_session_create(ds4_session **out, ds4_engine *engine,
+                              int ctx_size, const cli_config *cfg) {
+    if (ds4_session_create(out, engine, ctx_size) != 0) return 1;
+    if (cfg->v41_direction_file &&
+        ds4_session_v41_configure(*out, cfg->v41_direction_file, cfg->v41_digest,
+                                 cfg->v41_site, cfg->v41_strength, 0, 0) != 0) {
+        fprintf(stderr, "ds4: failed to configure V4.1 steering on new session\n");
+        ds4_session_free(*out);
+        *out = NULL;
+        return 1;
+    }
+    return 0;
+}
 
 static volatile sig_atomic_t cli_interrupted;
 static volatile sig_atomic_t cli_dist_busy;
@@ -538,7 +560,7 @@ static void cli_apply_model_sampling_defaults(
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&session, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
@@ -753,7 +775,7 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
 
 static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&session, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: --dump-logits requires a graph session backend\n");
         return 1;
     }
@@ -841,7 +863,7 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
 
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&session, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: --dump-logprobs requires a graph session backend\n");
         return 1;
     }
@@ -972,7 +994,7 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
 
     ds4_session *live = NULL;
     char err[160];
-    if (ds4_session_create(&live, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&live, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: --decode-consistency requires a graph session backend\n");
         ds4_tokens_free(&prefix);
         free(live_logits);
@@ -1035,7 +1057,7 @@ static int run_decode_consistency(ds4_engine *engine, const cli_config *cfg,
     live = NULL;
 
     ds4_session *fresh = NULL;
-    if (ds4_session_create(&fresh, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&fresh, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: failed to create fresh diagnostic session\n");
         ds4_tokens_free(&prefix);
         free(live_logits);
@@ -1124,7 +1146,7 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     }
 
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+    if (cli_session_create(&session, engine, cfg->gen.ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: --perplexity-file requires a graph session backend\n");
         ds4_tokens_free(&tokens);
         return 1;
@@ -1237,7 +1259,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                     ds4_backend_name(cfg->engine.backend));
         }
     } else {
-        if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
+        if (cfg->v41_direction_file ||
+            cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
             cfg->gen.temperature > 0.0f ||
@@ -1430,9 +1453,9 @@ static bool repl_chat_apply_think_prefix(ds4_engine *engine,
     return true;
 }
 
-static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
+static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size, const cli_config *cfg) {
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, ctx_size) != 0) {
+    if (cli_session_create(&session, engine, ctx_size, cfg) != 0) {
         fprintf(stderr, "ds4: interactive chat KV cache requires a session backend\n");
         return 1;
     }
@@ -1452,7 +1475,7 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
-    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
+    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size, cfg) != 0) {
         ds4_tokens_free(&chat->transcript);
         return 1;
     }
@@ -1496,11 +1519,11 @@ static void repl_chat_free(repl_chat *chat) {
     memset(chat, 0, sizeof(*chat));
 }
 
-static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size) {
+static int repl_chat_set_ctx(ds4_engine *engine, repl_chat *chat, int ctx_size, const cli_config *cfg) {
     ds4_session_free(chat->session);
     chat->session = NULL;
     chat->ctx_size = 0;
-    return repl_chat_create_session(engine, chat, ctx_size);
+    return repl_chat_create_session(engine, chat, ctx_size, cfg);
 }
 
 static bool repl_chat_assistant_turn_uses_eos(ds4_engine *engine) {
@@ -1794,6 +1817,11 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strncmp(cmd, "/steer", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
+            if (cfg->v41_direction_file) {
+                fprintf(stderr, "ds4: /steer is legacy FFN only; restart with --dir-steering-strength to change V4.1 steering\n");
+                linenoiseFree(line);
+                continue;
+            }
             if (!arg[0]) {
                 printf("Steering FFN: %g.\n",
                        (double)ds4_session_directional_steering_ffn(chat.session));
@@ -1817,7 +1845,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                                    cfg->gen.ctx_size,
                                    ds4_engine_prefill_chunk(engine),
                                    cfg->engine.ssd_streaming);
-                rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
+                rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size, cfg);
                 if (rc != 0) {
                     linenoiseFree(line);
                     break;
@@ -2109,6 +2137,15 @@ static cli_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-strength")) {
+            c.v41_strength = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            uint32_t bits;
+            memcpy(&bits, &c.v41_strength, sizeof(bits));
+            if (!ds41_bits_finite(bits)) {
+                fprintf(stderr, "ds4: --dir-steering-strength must be finite\n");
+                exit(2);
+            }
+            c.v41_strength_set = true;
         } else if (!strcmp(arg, "--expert-profile")) {
             c.engine.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -2215,6 +2252,55 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    /* DS41DIR selects the session API, never the legacy FFN default. Explicit
+     * strength also routes damaged/legacy inputs through strict V4.1 validation. */
+    bool v41_file = false;
+    if (c.engine.directional_steering_file) {
+        unsigned char magic[8];
+        FILE *fp = fopen(c.engine.directional_steering_file, "rb");
+        if (!fp) { perror("ds4: direction file"); exit(2); }
+        v41_file = fread(magic, 1, sizeof(magic), fp) == sizeof(magic) &&
+                   memcmp(magic, "DS41DIR\0", 8) == 0;
+        fclose(fp);
+    }
+    if (v41_file || c.v41_strength_set) {
+        if (!c.engine.directional_steering_file || !c.v41_strength_set ||
+            directional_steering_scale_set) {
+            fprintf(stderr, "ds4: V4.1 requires --dir-steering-file and explicit --dir-steering-strength; --dir-steering-ffn/attn are incompatible\n");
+            exit(2);
+        }
+        if (c.engine.backend != DS4_BACKEND_METAL || c.gpu_vram_arg ||
+            c.gpu_devices_arg || c.engine.cuda_tensor_parallel ||
+            c.dist->role != DS4_DISTRIBUTED_NONE || c.engine.tp.role != DS4_TP_NONE ||
+            c.engine.glm_mtp || c.engine.mtp_path || c.engine.dspark ||
+            c.inspect || c.gen.dump_tokens || c.gen.head_test || c.gen.first_token_test ||
+            c.gen.metal_graph_test || c.gen.metal_graph_full_test ||
+            c.gen.metal_graph_prompt_test || c.gen.imatrix_output_path) {
+            fprintf(stderr, "ds4: V4.1 steering requires ordinary single-process Metal session generation; backend, speculative or engine diagnostic mode is unsupported\n");
+            exit(2);
+        }
+        /* Validate the entire file cheaply before opening a huge model. This
+         * preliminary digest is NOT model verification; the opened model is
+         * independently hashed below before any session is configured. */
+        FILE *fp = fopen(c.engine.directional_steering_file, "rb");
+        unsigned char header[DS41_DIRECTION_HEADER];
+        ds41_direction *direction = malloc(sizeof(*direction));
+        const char *error = "missing or truncated direction header";
+        bool valid = fp && direction && fread(header, 1, sizeof(header), fp) == sizeof(header);
+        if (valid) {
+            rewind(fp);
+            valid = ds41_direction_read(fp, header + 40, direction, &error);
+        }
+        if (fp) fclose(fp);
+        free(direction);
+        if (!valid) {
+            fprintf(stderr, "ds4: V4.1 direction rejected: %s\n", error);
+            exit(2);
+        }
+        c.v41_direction_file = c.engine.directional_steering_file;
+        c.engine.directional_steering_file = NULL;
+        c.engine.directional_steering_ffn = c.engine.directional_steering_attn = 0;
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -2343,6 +2429,33 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (cfg.v41_direction_file) {
+        if (!ds4_engine_is_deepseek41(engine)) {
+            fprintf(stderr, "ds4: --dir-steering-strength requires a V4.1 model\n");
+            ds4_engine_close(engine);
+            return 2;
+        }
+        fprintf(stderr, "ds4: verifying full deployment model SHA256 once...\n");
+        if (ds4_engine_model_sha256(engine, cfg.v41_digest) != 0) {
+            fprintf(stderr, "ds4: could not verify deployment model SHA256\n");
+            ds4_engine_close(engine);
+            return 2;
+        }
+        ds41_direction *direction = malloc(sizeof(*direction));
+        FILE *fp = fopen(cfg.v41_direction_file, "rb");
+        const char *error = "allocation failure";
+        bool valid = direction && ds41_direction_read(fp, cfg.v41_digest, direction, &error);
+        if (fp) fclose(fp);
+        if (valid) cfg.v41_site = direction->site;
+        free(direction);
+        if (!valid) {
+            fprintf(stderr, "ds4: V4.1 direction rejected: %s\n", error);
+            ds4_engine_close(engine);
+            return 2;
+        }
+        fprintf(stderr, "ds4: verified V4.1 %s steering, strength %g\n",
+                cfg.v41_site == DS41_SITE_WRITER ? "writer" : "residual", (double)cfg.v41_strength);
     }
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");

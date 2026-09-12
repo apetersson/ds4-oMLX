@@ -70,3 +70,10 @@ __pycache__/
 /tests/test_v41_writer_live
 
 /tests/test_v41_session_isolation
+
+/tests/test_v41_cli
+/work/
+
+/tests/test_v41_cli_live
+
+tests/test_v41_server

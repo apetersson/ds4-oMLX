@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_v41_intervention.h"
+#include "ds4_model_hash.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -65734,7 +65735,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal inference, with optional tensor parallelism; "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+                            "DSpark, legacy engine steering and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -68106,6 +68107,11 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
         return -1;
     }
     return ds4_dist_session_route_ready(s->distributed, err, errlen);
+}
+
+int ds4_engine_model_sha256(ds4_engine *e, unsigned char digest[32]) {
+    if (!e) { if (digest) memset(digest, 0, 32); return 1; }
+    return ds4_model_fd_sha256(e->model.fd, e->model.file_size, digest);
 }
 
 /* The caller verifies the full model digest before supplying it here. This

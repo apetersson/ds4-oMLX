@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_v41_intervention.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -14498,7 +14499,117 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    const char *v41_direction_file;
+    bool v41_strength_set;
+    bool legacy_steering_scale_set;
+    float v41_strength;
+    uint32_t v41_site;
+    unsigned char v41_digest[32];
 } server_config;
+
+/* Run after --chdir, so direction and model paths share the server's usual
+ * working-directory semantics. No model or session has been opened yet. */
+static int server_prepare_v41(server_config *cfg) {
+    const char *path = cfg->engine.directional_steering_file;
+    bool versioned = false;
+    if (path) {
+        unsigned char magic[8];
+        FILE *fp = fopen(path, "rb");
+        if (!fp) { perror("ds4-server: direction file"); return 2; }
+        versioned = fread(magic, 1, sizeof(magic), fp) == sizeof(magic) &&
+                    !memcmp(magic, "DS41DIR\0", 8);
+        fclose(fp);
+    }
+    if (!versioned && !cfg->v41_strength_set) return 0;
+    if (!path || !cfg->v41_strength_set || cfg->legacy_steering_scale_set) {
+        fprintf(stderr, "ds4-server: V4.1 requires --dir-steering-file and explicit --dir-steering-strength; --dir-steering-ffn/attn are incompatible\n");
+        return 2;
+    }
+    uint32_t bits;
+    memcpy(&bits, &cfg->v41_strength, sizeof(bits));
+    if (!ds41_bits_finite(bits) || cfg->v41_strength < -100 || cfg->v41_strength > 100) {
+        fprintf(stderr, "ds4-server: V4.1 strength must be finite and within [-100,100]\n");
+        return 2;
+    }
+    if (cfg->engine.backend != DS4_BACKEND_METAL || cfg->gpu_vram_arg ||
+        cfg->gpu_devices_arg || cfg->engine.cuda_tensor_parallel ||
+        cfg->engine.distributed.role != DS4_DISTRIBUTED_NONE ||
+        cfg->engine.tp.role != DS4_TP_NONE || cfg->engine.glm_mtp ||
+        cfg->engine.mtp_path || cfg->engine.dspark) {
+        fprintf(stderr, "ds4-server: V4.1 steering requires single-process Metal without speculative or distributed/tensor-parallel modes\n");
+        return 2;
+    }
+    /* Disk-cache headers carry model/quant identity but no intervention identity.
+     * Live slots are safe: every slot has this one immutable startup setting. */
+    if (cfg->kv_disk_dir) {
+        fprintf(stderr, "ds4-server: --kv-disk-dir is incompatible with V4.1 steering; disk caches do not identify the intervention (live KV reuse remains enabled)\n");
+        return 2;
+    }
+    FILE *fp = fopen(path, "rb");
+    unsigned char header[DS41_DIRECTION_HEADER];
+    ds41_direction *direction = malloc(sizeof(*direction));
+    const char *error = "missing or truncated direction header";
+    bool valid = fp && direction && fread(header, 1, sizeof(header), fp) == sizeof(header);
+    if (valid) {
+        rewind(fp);
+        /* Structural preflight only. Actual model identity is verified below. */
+        valid = ds41_direction_read(fp, header + 40, direction, &error);
+    }
+    if (fp) fclose(fp);
+    if (valid) cfg->v41_site = direction->site;
+    free(direction);
+    if (!valid) {
+        fprintf(stderr, "ds4-server: V4.1 direction rejected: %s\n", error);
+        return 2;
+    }
+    cfg->v41_direction_file = path;
+    cfg->engine.directional_steering_file = NULL;
+    cfg->engine.directional_steering_ffn = cfg->engine.directional_steering_attn = 0;
+    return 0;
+}
+
+static int server_verify_v41(server_config *cfg, ds4_engine *engine) {
+    if (!cfg->v41_direction_file) return 0;
+    if (!ds4_engine_is_deepseek41(engine)) {
+        fprintf(stderr, "ds4-server: --dir-steering-strength requires a V4.1 model\n");
+        return 2;
+    }
+    fprintf(stderr, "ds4-server: verifying full deployment model SHA256 once...\n");
+    if (ds4_engine_model_sha256(engine, cfg->v41_digest) != 0) {
+        fprintf(stderr, "ds4-server: could not verify deployment model SHA256\n");
+        return 2;
+    }
+    FILE *fp = fopen(cfg->v41_direction_file, "rb");
+    ds41_direction *direction = malloc(sizeof(*direction));
+    const char *error = "allocation failure";
+    bool valid = direction && ds41_direction_read(fp, cfg->v41_digest, direction, &error);
+    if (fp) fclose(fp);
+    if (valid && direction->site != cfg->v41_site) {
+        valid = false; error = "site changed since preflight";
+    }
+    free(direction);
+    if (!valid) {
+        fprintf(stderr, "ds4-server: V4.1 direction rejected: %s\n", error ? error : "site changed since preflight");
+        return 2;
+    }
+    fprintf(stderr, "ds4-server: verified V4.1 %s steering, strength %g (all slots)\n",
+            cfg->v41_site == DS41_SITE_WRITER ? "writer" : "residual", (double)cfg->v41_strength);
+    return 0;
+}
+
+static int server_create_session(ds4_session **out, ds4_engine *engine,
+                                  const server_config *cfg) {
+    if (ds4_session_create(out, engine, cfg->ctx_size) != 0) return 1;
+    if (cfg->v41_direction_file &&
+        ds4_session_v41_configure(*out, cfg->v41_direction_file, cfg->v41_digest,
+                                 cfg->v41_site, cfg->v41_strength, 0, 0) != 0) {
+        fprintf(stderr, "ds4-server: failed to configure V4.1 steering on session\n");
+        ds4_session_free(*out);
+        *out = NULL;
+        return 1;
+    }
+    return 0;
+}
 
 static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
@@ -14807,6 +14918,9 @@ static server_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-strength")) {
+            c.v41_strength = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            c.v41_strength_set = true;
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
@@ -14847,6 +14961,7 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
+    c.legacy_steering_scale_set = directional_steering_scale_set;
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
@@ -14913,6 +15028,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (server_prepare_v41(&cfg) != 0) return 2;
+
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.placement_session_count_hint =
@@ -14947,6 +15064,11 @@ int main(int argc, char **argv) {
         }
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
+    }
+
+    if (server_verify_v41(&cfg, engine) != 0) {
+        ds4_engine_close(engine);
+        return 2;
     }
 
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -15030,7 +15152,7 @@ int main(int argc, char **argv) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
-        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
+        if (server_create_session(&slot->session, engine, &cfg) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
                        ds4_backend_name(cfg.engine.backend), i + 1, slot_count);
